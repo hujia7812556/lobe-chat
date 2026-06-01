@@ -12,13 +12,13 @@ import {
   Markdown,
   Text,
 } from '@lobehub/ui';
-import { App } from 'antd';
+import { confirmModal } from '@lobehub/ui/base-ui';
 import { cssVar } from 'antd-style';
-import dayjs from 'dayjs';
 import { MessageCircle, MoreHorizontal, Pencil, Trash } from 'lucide-react';
 import { memo, useCallback, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
+import { useActivityTime } from '@/hooks/useActivityTime';
 import { useTaskStore } from '@/store/task';
 
 import { styles } from '../shared/style';
@@ -29,7 +29,6 @@ interface CommentCardProps {
 
 const CommentCard = memo<CommentCardProps>(({ activity }) => {
   const { t } = useTranslation('chat');
-  const { modal } = App.useApp();
   const deleteComment = useTaskStore((s) => s.deleteComment);
   const updateComment = useTaskStore((s) => s.updateComment);
 
@@ -37,7 +36,7 @@ const CommentCard = memo<CommentCardProps>(({ activity }) => {
   const [submitting, setSubmitting] = useState(false);
   const editor = useEditor();
 
-  const relTime = activity.time ? dayjs(activity.time).fromNow() : '';
+  const { text: relTime, title: relTimeTitle } = useActivityTime(activity.time);
   const content = activity.content || t('taskDetail.activities.fallback.comment');
   const commentId = activity.id;
 
@@ -64,16 +63,14 @@ const CommentCard = memo<CommentCardProps>(({ activity }) => {
 
   const handleDelete = useCallback(() => {
     if (!commentId) return;
-    modal.confirm({
-      centered: true,
+    confirmModal({
       content: t('taskDetail.comment.deleteConfirm.content'),
       okButtonProps: { danger: true },
       okText: t('taskDetail.comment.deleteConfirm.ok'),
       onOk: () => deleteComment(commentId),
       title: t('taskDetail.comment.deleteConfirm.title'),
-      type: 'error',
     });
-  }, [commentId, deleteComment, modal, t]);
+  }, [commentId, deleteComment, t]);
 
   const menuItems = useMemo<DropdownItem[]>(
     () => [
@@ -98,7 +95,8 @@ const CommentCard = memo<CommentCardProps>(({ activity }) => {
     <Block
       className={styles.commentCard}
       gap={8}
-      padding={12}
+      paddingBlock={12}
+      paddingInline={8}
       style={{ borderRadius: cssVar.borderRadiusLG }}
       variant={'outlined'}
     >
@@ -114,7 +112,7 @@ const CommentCard = memo<CommentCardProps>(({ activity }) => {
           {activity.author?.name || t('taskDetail.activities.fallback.comment')}
         </Text>
         {relTime && (
-          <Text fontSize={12} type={'secondary'}>
+          <Text fontSize={12} title={relTimeTitle} type={'secondary'}>
             {relTime}
           </Text>
         )}

@@ -1,8 +1,9 @@
 import { ActionIcon, Button, DropdownMenu, Flexbox, Skeleton, Text } from '@lobehub/ui';
+import { confirmModal } from '@lobehub/ui/base-ui';
 import { App, Space } from 'antd';
 import { cssVar } from 'antd-style';
 import { CircleX, EllipsisVertical, LucideRefreshCcwDot, PlusIcon } from 'lucide-react';
-import { memo, useState } from 'react';
+import { memo, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { useIsMobile } from '@/hooks/useIsMobile';
@@ -21,7 +22,7 @@ interface ModelFetcherProps {
 const ModelTitle = memo<ModelFetcherProps>(
   ({ provider, showAddNewModel = true, showModelFetcher = true }) => {
     const { t } = useTranslation('modelProvider');
-    const { modal, message } = App.useApp();
+    const { message } = App.useApp();
     const [
       searchKeyword,
       totalModels,
@@ -49,6 +50,10 @@ const ModelTitle = memo<ModelFetcherProps>(
     const [showModal, setShowModal] = useState(false);
 
     const mobile = useIsMobile();
+
+    useEffect(() => {
+      useAiInfraStore.setState({ modelSearchKeyword: '' });
+    }, [provider]);
 
     return (
       <Flexbox
@@ -143,7 +148,7 @@ const ModelTitle = memo<ModelFetcherProps>(
                       key: 'reset',
                       label: t('providerModels.list.resetAll.title'),
                       onClick: async () => {
-                        modal.confirm({
+                        confirmModal({
                           content: t('providerModels.list.resetAll.conform'),
                           onOk: async () => {
                             await clearModelsByProvider(provider);
