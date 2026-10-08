@@ -1,6 +1,6 @@
 import { Ollama } from '@lobehub/icons';
-import { Alert, Button, Center, Flexbox, Input } from '@lobehub/ui';
-import { Progress } from 'antd';
+import { Center, Flexbox } from '@lobehub/ui';
+import { Alert, Button, Input, Progress } from '@lobehub/ui/base-ui';
 import { cssVar } from 'antd-style';
 import { type ReactNode } from 'react';
 import { memo, useCallback, useMemo, useState } from 'react';
@@ -80,12 +80,7 @@ const OllamaModelDownloader = memo<OllamaModelDownloaderProps>(
         </FormAction>
         {isDownloading && (
           <Flexbox flex={1} gap={8} style={{ maxWidth: 300 }} width={'100%'}>
-            <Progress
-              showInfo
-              percent={percent}
-              strokeColor={cssVar.colorSuccess}
-              trailColor={cssVar.colorSuccessBg}
-            />
+            <Progress showInfo percent={percent} strokeColor={cssVar.colorSuccess} />
             <Flexbox
               horizontal
               distribution={'space-between'}

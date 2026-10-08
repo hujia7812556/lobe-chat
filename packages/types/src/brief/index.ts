@@ -37,6 +37,13 @@ export const DEFAULT_BRIEF_ACTIONS: Record<string, BriefAction[]> = {
 export type BriefType = 'decision' | 'error' | 'insight' | 'result';
 
 /**
+ * Brief types with nothing to decide — the home "news" digest. Shared between
+ * the server day-feed query and the client feed split so the two can never
+ * disagree on what counts as news.
+ */
+export const NEWS_BRIEF_TYPES: BriefType[] = ['insight', 'result'];
+
+/**
  * A single artifact (currently only documents) referenced from a brief.
  * Programmatically collected during topic completion, not produced by the LLM.
  */
@@ -58,10 +65,34 @@ export interface BriefAgentSignalMetadata {
   nightlySelfReview?: unknown;
 }
 
+/**
+ * Goal-owned Brief metadata: what a goal brief stands for, so answering it from
+ * the inbox acts on the goal and the goal settles it when answered elsewhere.
+ */
+export interface BriefGoalMetadata {
+  /** Present on a decision brief — the gate it mirrors. */
+  decisionId?: string;
+  goalId: string;
+  goalTitle: string;
+  /** What the brief is for. */
+  kind: 'decision' | 'signOff';
+  /** The action the goal advises — set apart among the brief's buttons. */
+  recommendedAction?: string;
+  /** Present on a sign-off brief — the Goal-level acceptance to sign. */
+  signOffAcceptanceId?: string;
+}
+
 /** Freeform Brief metadata namespaced by feature owner. */
 export interface BriefMetadata {
   /** Other feature namespaces remain possible without schema churn. */
   [key: string]: unknown;
   /** Agent Signal extension metadata. */
   agentSignal?: BriefAgentSignalMetadata;
+  goal?: BriefGoalMetadata;
+  /**
+   * `llm_generation_tracing` row id of the generation that produced this brief's
+   * title/summary. Set for LLM-synthesized briefs so the user's resolve action
+   * (approve / feedback / ignore) can be reported back as implicit feedback.
+   */
+  tracingId?: string;
 }

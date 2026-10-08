@@ -1,14 +1,65 @@
+import type { AiFullModelCard } from 'model-bank';
 import type { PartialDeep } from 'type-fest';
 
-import type { IFeatureFlagsState } from '@/config/featureFlags';
-
-import type { ChatModelCard } from './llm';
 import type {
   GlobalLLMProviderKey,
   UserDefaultAgent,
   UserImageConfig,
   UserServiceModelConfig,
 } from './user/settings';
+
+/**
+ * Resolved server feature flags, keyed for the client. The canonical mapping
+ * lives in `@lobechat/app-config`'s `mapFeatureFlagsEnvToState`, whose explicit
+ * return-type annotation pins it to this interface — add a flag there and the
+ * compiler forces the field to be added here (and vice versa).
+ *
+ * Deliberately a `type` alias: aliases carry an implicit index signature, so
+ * existing `as Record<string, unknown>` conversions keep compiling.
+ */
+export type IFeatureFlagsState = {
+  enableAgentOnboarding: boolean | undefined;
+  enableAgentSelfIteration: boolean | undefined;
+  /**
+   * Agent Share capability: may this user publish an Agent as a shared link AND
+   * open/chat on an already-live shared agent. One allowlist gates both sides.
+   */
+  enableAgentShare: boolean | undefined;
+  enableAuthCaptcha: boolean | undefined;
+  enableCheckUpdates: boolean | undefined;
+  enableDevDock: boolean | undefined;
+  /**
+   * Rollout gate for the multiplexed gateway socket. Necessary but not
+   * sufficient: the transport also requires
+   * `GlobalServerConfig.agentGatewayProtocol === 2`.
+   */
+  enableGatewayMux: boolean | undefined;
+  enableKnowledgeBase: boolean | undefined;
+  /**
+   * Rollout gate for relaying LLM calls of device-only model providers to the
+   * client that started the run (`agent_llm_relay`). The client declares itself
+   * as an executor only when this is on; the server checks it again.
+   */
+  enableLlmRelay: boolean | undefined;
+  enableOnboardingV2: boolean | undefined;
+  enableRAGEval: boolean | undefined;
+  enableSTT: boolean | undefined;
+  enableStorageOverage: boolean | undefined;
+  enableVoiceDictation: boolean | undefined;
+  enableWorkspace: boolean | undefined;
+  hideDocs: boolean | undefined;
+  hideGitHub: boolean | undefined;
+  isAgentEditable: boolean | undefined;
+  showAiImage: boolean | undefined;
+  showApiKeyManage: boolean | undefined;
+  showChangelog: boolean | undefined;
+  showCloudPromotion: boolean | undefined;
+  showMarket: boolean | undefined;
+  showOpenAIApiKey: boolean | undefined;
+  showOpenAIProxyUrl: boolean | undefined;
+  showProvider: boolean | undefined;
+  showWelcomeSuggest: boolean | undefined;
+};
 
 export type GlobalMemoryLayer = 'activity' | 'context' | 'experience' | 'identity' | 'preference';
 
@@ -34,7 +85,7 @@ export interface GlobalMemoryConfig {
   userMemory?: GlobalMemoryExtractionConfig;
 }
 
-export interface VisualUnderstandingConfig {
+export interface MultimodalUnderstandingConfig {
   model: string;
   provider: string;
 }
@@ -46,12 +97,23 @@ export interface ServerModelProviderConfig {
   /**
    * the model lists defined in server
    */
-  serverModelLists?: ChatModelCard[];
+  serverModelLists?: AiFullModelCard[];
 }
 
 export type ServerLanguageModel = Partial<Record<GlobalLLMProviderKey, ServerModelProviderConfig>>;
 
 export interface GlobalServerConfig {
+  /**
+   * Which Agent Gateway wire protocol this deployment's gateway can serve:
+   * `2` when it exposes the per-user multiplexed socket (`/v2/ws`), `1` when
+   * it only has the per-operation one (`/ws`). Absent ⇒ 1.
+   *
+   * A capability, not a rollout switch: the client may only pick the
+   * multiplexed transport where the server says it exists, and there is no
+   * negotiation on the socket itself — dialing `/v2/ws` on a gateway without
+   * it is a 404 with nothing to fall back to until the client gives up.
+   */
+  agentGatewayProtocol?: 1 | 2;
   /**
    * Agent Gateway URL for WebSocket-based agent execution.
    * When set, the SPA can offload agent execution to the server and receive
@@ -75,16 +137,25 @@ export interface GlobalServerConfig {
   enableLobehubSkill?: boolean;
   enableMagicLink?: boolean;
   enableMarketTrustedClient?: boolean;
+  enableMultimodalUnderstanding?: boolean;
   enableUploadFileToServer?: boolean;
-  enableVisualUnderstanding?: boolean;
   image?: PartialDeep<UserImageConfig>;
   memory?: GlobalMemoryConfig;
+  multimodalUnderstanding?: MultimodalUnderstandingConfig;
   oAuthSSOProviders?: string[];
   systemAgent?: PartialDeep<UserServiceModelConfig>;
   telemetry: {
     langfuse?: boolean;
   };
-  visualUnderstanding?: VisualUnderstandingConfig;
+  /**
+   * `TOOL_NAME_MAX_LENGTH`: the length at which a function-call tool name gets
+   * compressed to an opaque `MD5HASH_…`, `0` disabling that compression.
+   * Exposed to the client because the client-driven chat path builds the tool
+   * payload in the browser, where the server env isn't visible — without this
+   * the var would only take effect in gateway (server-run) mode.
+   * Undefined means "not configured": the default (64) applies.
+   */
+  toolNameMaxLength?: number;
 }
 
 export interface GlobalBillboardItemLocaleFields {
@@ -94,6 +165,12 @@ export interface GlobalBillboardItemLocaleFields {
 }
 
 export interface GlobalBillboardItem {
+  /**
+   * In-app action enum as delivered by the platform (unvalidated string).
+   * The client narrows it at runtime against the registry in
+   * `src/features/Billboard/actions.ts`; unrecognized values fall back to `linkUrl`.
+   */
+  action?: string | null;
   cover?: string | null;
   description: string;
   /**

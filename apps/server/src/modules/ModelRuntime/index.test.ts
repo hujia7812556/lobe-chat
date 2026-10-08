@@ -22,11 +22,38 @@ import {
   ModelRuntime,
 } from '@lobechat/model-runtime';
 import { LobeVertexAI } from '@lobechat/model-runtime/vertexai';
-import { type ClientSecretPayload } from '@lobechat/types';
+import { ChatErrorType, type ClientSecretPayload } from '@lobechat/types';
 import { ModelProvider } from 'model-bank';
 import { describe, expect, it, vi } from 'vitest';
 
-import { buildPayloadFromKeyVaults, initModelRuntimeWithUserPayload } from './index';
+import {
+  buildPayloadFromKeyVaults,
+  getServerDefaultHeterogeneousModels,
+  initModelRuntimeFromServerConfig,
+  initModelRuntimeWithUserPayload,
+  resolveServerDefaultHeterogeneousModel,
+  resolveServerModel,
+} from './index';
+
+const getServerGlobalConfig = vi.hoisted(() => vi.fn());
+const loadModels = vi.hoisted(() => vi.fn());
+
+vi.mock('@/business/client/model-bank/loadModels', () => ({
+  loadModels,
+}));
+
+vi.mock('@/server/globalConfig', () => ({
+  getServerGlobalConfig,
+}));
+
+interface InspectableBedrockRuntime {
+  client: {
+    config: {
+      token?: () => Promise<{ token: string }>;
+    };
+  };
+  region: string;
+}
 
 // 模拟依赖项
 vi.mock('@/envs/llm', () => ({
@@ -58,6 +85,610 @@ vi.mock('@/envs/llm', () => ({
   })),
 }));
 
+describe('resolveServerModel', () => {
+  it('accepts only an enabled deployment-owned chat model', async () => {
+    getServerGlobalConfig.mockResolvedValue({
+      aiProvider: {
+        openai: {
+          enabled: true,
+          serverModelLists: [
+            { enabled: true, id: 'gpt-server', type: 'chat' },
+            { enabled: false, id: 'gpt-disabled', type: 'chat' },
+          ],
+        },
+      },
+    });
+
+    await expect(resolveServerModel('openai', 'gpt-server')).resolves.toEqual({
+      model: 'gpt-server',
+      provider: 'openai',
+    });
+    await expect(resolveServerModel('openai', 'gpt-disabled')).rejects.toThrow(
+      'selected server model is not available',
+    );
+  });
+
+  it('preserves a deployment-owned model mapping', async () => {
+    getServerGlobalConfig.mockResolvedValue({
+      aiProvider: {
+        azure: {
+          enabled: true,
+          serverModelLists: [
+            {
+              config: { deploymentName: 'prod-gpt' },
+              enabled: true,
+              id: 'gpt-4o',
+              type: 'chat',
+            },
+          ],
+        },
+      },
+    });
+
+    await expect(resolveServerModel('azure', 'gpt-4o')).resolves.toEqual({
+      deploymentName: 'prod-gpt',
+      model: 'gpt-4o',
+      provider: 'azure',
+    });
+  });
+});
+
+describe('getServerDefaultHeterogeneousModels', () => {
+  it('discovers and resolves new tool-capable models without a deployment opt-in', async () => {
+    getServerGlobalConfig.mockResolvedValue({
+      aiProvider: {
+        lobehub: {
+          enabled: true,
+          serverModelLists: [
+            {
+              abilities: { functionCall: true },
+              enabled: true,
+              id: 'deployment-new-model',
+              type: 'chat',
+            },
+            { abilities: { functionCall: true }, enabled: true, id: 'kimi-k3', type: 'chat' },
+          ],
+        },
+      },
+    });
+    expect(
+      (await getServerDefaultHeterogeneousModels())['kimi-code'].map(({ model }) => model),
+    ).toEqual(['deployment-new-model', 'kimi-k3']);
+    await expect(
+      resolveServerDefaultHeterogeneousModel('kimi-code', 'deployment-new-model'),
+    ).resolves.toMatchObject({ model: 'deployment-new-model' });
+  });
+
+  it('offers newly enabled tool-capable catalog aliases to Kimi without an ID allowlist', async () => {
+    const ids = ['minimax-m3', 'zai-org/GLM-5.2', 'doubao-seed-2-1-pro', 'qwen3.7-plus'];
+    getServerGlobalConfig.mockResolvedValue({
+      aiProvider: {
+        lobehub: {
+          enabled: true,
+          serverModelLists: ids.map((id) => ({
+            abilities: { functionCall: true },
+            enabled: true,
+            id,
+            type: 'chat',
+          })),
+        },
+      },
+    });
+    const models = await getServerDefaultHeterogeneousModels();
+    expect(models['kimi-code'].map(({ model }) => model)).toEqual(ids);
+    await expect(
+      resolveServerDefaultHeterogeneousModel('kimi-code', ids[0]),
+    ).resolves.toMatchObject({ model: ids[0] });
+  });
+
+  it('returns only compatible V1 models from the LobeHub relay provider', async () => {
+    getServerGlobalConfig.mockResolvedValue({
+      aiProvider: {
+        anthropic: {
+          enabled: true,
+          serverModelLists: [{ enabled: true, id: 'claude-opus-4-8', type: 'chat' }],
+        },
+        google: {
+          enabled: true,
+          serverModelLists: [{ enabled: true, id: 'gemini-server', type: 'chat' }],
+        },
+        lobehub: {
+          enabled: true,
+          serverModelLists: [
+            { enabled: true, id: 'claude-sonnet-4-6', type: 'chat' },
+            { enabled: false, id: 'claude-haiku-4-5', type: 'chat' },
+            { enabled: true, id: 'gpt-5.4', type: 'chat' },
+            { enabled: true, id: 'gpt-4o', type: 'chat' },
+            { enabled: true, id: 'gemini-3.1-pro-preview', type: 'chat' },
+            { enabled: true, id: 'claude-image', type: 'image' },
+          ],
+        },
+        openai: {
+          enabled: true,
+          serverModelLists: [{ enabled: true, id: 'gpt-5.4', type: 'chat' }],
+        },
+      },
+    });
+
+    await expect(getServerDefaultHeterogeneousModels()).resolves.toEqual({
+      'claude-code': [{ model: 'claude-sonnet-4-6' }],
+      'codex': [{ model: 'gpt-5.4' }],
+      'grok-build': [{ model: 'claude-sonnet-4-6' }],
+      'kimi-code': [{ model: 'claude-sonnet-4-6' }],
+      'pi': [{ model: 'claude-sonnet-4-6' }],
+      'trae': [{ model: 'claude-sonnet-4-6' }],
+    });
+  });
+
+  it('uses the model bank when the deployment has no explicit server model list', async () => {
+    getServerGlobalConfig.mockResolvedValue({
+      aiProvider: {
+        lobehub: { enabled: true, serverModelLists: undefined },
+      },
+    });
+    loadModels.mockResolvedValue([
+      {
+        enabled: true,
+        id: 'claude-sonnet-4-6',
+        providerId: 'lobehub',
+        source: 'builtin',
+        type: 'chat',
+      },
+      {
+        enabled: true,
+        id: 'gpt-5.4',
+        providerId: 'lobehub',
+        source: 'builtin',
+        type: 'chat',
+      },
+      {
+        enabled: true,
+        id: 'claude-opus-4-8',
+        providerId: 'anthropic',
+        source: 'builtin',
+        type: 'chat',
+      },
+    ]);
+
+    await expect(getServerDefaultHeterogeneousModels()).resolves.toEqual({
+      'claude-code': [{ model: 'claude-sonnet-4-6' }],
+      'codex': [{ model: 'gpt-5.4' }],
+      'grok-build': [{ model: 'claude-sonnet-4-6' }],
+      'kimi-code': [{ model: 'claude-sonnet-4-6' }],
+      'pi': [{ model: 'claude-sonnet-4-6' }],
+      'trae': [{ model: 'claude-sonnet-4-6' }],
+    });
+  });
+
+  it('offers tool-capable relay models to compatible agents and keeps Codex narrow', async () => {
+    getServerGlobalConfig.mockResolvedValue({
+      aiProvider: {
+        lobehub: {
+          enabled: true,
+          serverModelLists: [
+            { abilities: { functionCall: true }, enabled: true, id: 'kimi-k2.6', type: 'chat' },
+            {
+              abilities: { functionCall: true },
+              enabled: true,
+              id: 'deepseek-v4-flash',
+              type: 'chat',
+            },
+            {
+              abilities: { functionCall: true },
+              enabled: true,
+              id: 'deepseek-v4-pro',
+              type: 'chat',
+            },
+            {
+              abilities: { functionCall: true },
+              enabled: true,
+              id: 'glm-5.2',
+              type: 'chat',
+            },
+            {
+              abilities: { functionCall: true },
+              enabled: true,
+              id: 'gemini-3.1-pro-preview',
+              type: 'chat',
+            },
+            { abilities: { reasoning: true }, enabled: true, id: 'no-tools-model', type: 'chat' },
+            { abilities: { functionCall: true }, enabled: false, id: 'kimi-k3', type: 'chat' },
+            { abilities: { functionCall: true }, enabled: true, id: 'kimi-image', type: 'image' },
+          ],
+        },
+      },
+    });
+
+    await expect(getServerDefaultHeterogeneousModels()).resolves.toEqual({
+      'claude-code': [
+        { model: 'kimi-k2.6' },
+        { model: 'deepseek-v4-flash' },
+        { model: 'deepseek-v4-pro' },
+        { model: 'glm-5.2' },
+        { model: 'gemini-3.1-pro-preview' },
+      ],
+      'codex': [{ model: 'deepseek-v4-flash' }, { model: 'deepseek-v4-pro' }, { model: 'glm-5.2' }],
+      'grok-build': [
+        { model: 'kimi-k2.6' },
+        { model: 'deepseek-v4-flash' },
+        { model: 'deepseek-v4-pro' },
+        { model: 'glm-5.2' },
+        { model: 'gemini-3.1-pro-preview' },
+      ],
+      'kimi-code': [
+        { model: 'kimi-k2.6' },
+        { model: 'deepseek-v4-flash' },
+        { model: 'deepseek-v4-pro' },
+        { model: 'glm-5.2' },
+        { model: 'gemini-3.1-pro-preview' },
+      ],
+      'pi': [
+        { model: 'kimi-k2.6' },
+        { model: 'deepseek-v4-flash' },
+        { model: 'deepseek-v4-pro' },
+        { model: 'glm-5.2' },
+        { model: 'gemini-3.1-pro-preview' },
+      ],
+      'trae': [
+        { model: 'kimi-k2.6' },
+        { model: 'deepseek-v4-flash' },
+        { model: 'deepseek-v4-pro' },
+        { model: 'glm-5.2' },
+        { model: 'gemini-3.1-pro-preview' },
+      ],
+    });
+  });
+
+  it('offers tool-capable GPT and Gemini models to Kimi without a profile allowlist', async () => {
+    const toolCapableModels = [
+      'gpt-5.6-sol',
+      'gpt-5.6-terra',
+      'gpt-5.6-luna',
+      'gpt-5.5',
+      'gpt-5.5-pro',
+      'gemini-3.7-flash',
+      'gemini-3.6-flash',
+      'gemini-3.5-flash-lite',
+      'gemini-3.1-pro-preview',
+    ];
+    getServerGlobalConfig.mockResolvedValue({
+      aiProvider: {
+        lobehub: {
+          enabled: true,
+          serverModelLists: toolCapableModels.map((id) => ({
+            abilities: { functionCall: true },
+            enabled: true,
+            id,
+            type: 'chat',
+          })),
+        },
+      },
+    });
+
+    const models = await getServerDefaultHeterogeneousModels();
+
+    expect(models['kimi-code']).toEqual(toolCapableModels.map((model) => ({ model })));
+    expect(models['claude-code']).toEqual(toolCapableModels.map((model) => ({ model })));
+  });
+
+  it('uses tool capabilities rather than legacy deployment profile metadata for Kimi', async () => {
+    getServerGlobalConfig.mockResolvedValue({
+      aiProvider: {
+        lobehub: {
+          enabled: true,
+          serverModelLists: [
+            {
+              abilities: { functionCall: true },
+              agentCompatibility: {
+                serverDefaultHeterogeneousProfiles: ['kimi-code/anthropic-v1'],
+              },
+              enabled: true,
+              id: 'private-kimi-model',
+              type: 'chat',
+            },
+            {
+              abilities: { functionCall: true },
+              agentCompatibility: { serverDefaultHeterogeneousProfiles: [] },
+              enabled: true,
+              id: 'kimi-k3',
+              type: 'chat',
+            },
+            {
+              abilities: { functionCall: false },
+              agentCompatibility: {
+                serverDefaultHeterogeneousProfiles: ['kimi-code/anthropic-v1'],
+              },
+              enabled: true,
+              id: 'no-tools-model',
+              type: 'chat',
+            },
+          ],
+        },
+      },
+    });
+
+    await expect(getServerDefaultHeterogeneousModels()).resolves.toMatchObject({
+      'kimi-code': [{ model: 'private-kimi-model' }, { model: 'kimi-k3' }],
+    });
+  });
+
+  it('does not advertise hidden runtime-only models', async () => {
+    getServerGlobalConfig.mockResolvedValue({
+      aiProvider: {
+        lobehub: {
+          enabled: true,
+          serverModelLists: [
+            { abilities: { functionCall: true }, enabled: true, id: 'kimi-k3', type: 'chat' },
+            {
+              abilities: { functionCall: true },
+              enabled: true,
+              id: 'lobehub-onboarding-v1',
+              type: 'chat',
+              visible: false,
+            },
+          ],
+        },
+      },
+    });
+
+    await expect(getServerDefaultHeterogeneousModels()).resolves.toEqual({
+      'claude-code': [{ model: 'kimi-k3' }],
+      'codex': [],
+      'grok-build': [{ model: 'kimi-k3' }],
+      'kimi-code': [{ model: 'kimi-k3' }],
+      'pi': [{ model: 'kimi-k3' }],
+      'trae': [{ model: 'kimi-k3' }],
+    });
+  });
+
+  it('keeps Claude ids eligible when the relay catalog declares no abilities', async () => {
+    getServerGlobalConfig.mockResolvedValue({
+      aiProvider: {
+        lobehub: {
+          enabled: true,
+          serverModelLists: [
+            { enabled: true, id: 'claude-sonnet-4-6', type: 'chat' },
+            { enabled: true, id: 'kimi-k2.6', type: 'chat' },
+          ],
+        },
+      },
+    });
+
+    await expect(getServerDefaultHeterogeneousModels()).resolves.toEqual({
+      'claude-code': [{ model: 'claude-sonnet-4-6' }],
+      'codex': [],
+      'grok-build': [{ model: 'claude-sonnet-4-6' }],
+      'kimi-code': [{ model: 'claude-sonnet-4-6' }],
+      'pi': [{ model: 'claude-sonnet-4-6' }],
+      'trae': [{ model: 'claude-sonnet-4-6' }],
+    });
+  });
+});
+
+describe('resolveServerDefaultHeterogeneousModel', () => {
+  it.each([
+    { abilities: { functionCall: true }, id: 'new-tool-model', supported: true },
+    { id: 'kimi-k3', supported: false },
+    { abilities: { functionCall: false }, id: 'deepseek-v4-pro', supported: false },
+    { abilities: { functionCall: true }, enabled: false, id: 'disabled-model', supported: false },
+    { abilities: { functionCall: true }, id: 'hidden-model', supported: false, visible: false },
+    { abilities: { functionCall: true }, id: 'image-model', supported: false, type: 'image' },
+  ])(
+    'uses the same tool-capable policy for Kimi discovery and resolution: $id',
+    async ({ supported, ...model }) => {
+      getServerGlobalConfig.mockResolvedValue({
+        aiProvider: {
+          lobehub: {
+            enabled: true,
+            serverModelLists: [{ enabled: true, type: 'chat', ...model }],
+          },
+        },
+      });
+
+      const models = await getServerDefaultHeterogeneousModels();
+      expect(models['kimi-code']).toEqual(supported ? [{ model: model.id }] : []);
+
+      const resolution = resolveServerDefaultHeterogeneousModel('kimi-code', model.id);
+      if (supported) {
+        await expect(resolution).resolves.toMatchObject({ model: model.id, provider: 'lobehub' });
+      } else {
+        await expect(resolution).rejects.toThrow(/not available|not compatible/);
+      }
+    },
+  );
+
+  it('accepts only protocol-compatible models from the LobeHub relay provider', async () => {
+    getServerGlobalConfig.mockResolvedValue({
+      aiProvider: {
+        anthropic: {
+          enabled: true,
+          serverModelLists: [{ enabled: true, id: 'claude-sonnet-4-6', type: 'chat' }],
+        },
+        lobehub: {
+          enabled: true,
+          serverModelLists: [
+            { enabled: true, id: 'claude-sonnet-4-6', type: 'chat' },
+            { enabled: true, id: 'gpt-5.4', type: 'chat' },
+            { enabled: true, id: 'gpt-4o', type: 'chat' },
+          ],
+        },
+        openai: {
+          enabled: true,
+          serverModelLists: [{ enabled: true, id: 'gpt-5.4', type: 'chat' }],
+        },
+      },
+    });
+
+    await expect(
+      resolveServerDefaultHeterogeneousModel('claude-code', 'claude-sonnet-4-6'),
+    ).resolves.toMatchObject({ model: 'claude-sonnet-4-6', provider: 'lobehub' });
+    await expect(resolveServerDefaultHeterogeneousModel('codex', 'gpt-5.4')).resolves.toMatchObject(
+      { model: 'gpt-5.4', provider: 'lobehub' },
+    );
+
+    await expect(
+      resolveServerDefaultHeterogeneousModel('codex', 'claude-sonnet-4-6'),
+    ).rejects.toThrow('not compatible with this heterogeneous agent');
+    await expect(resolveServerDefaultHeterogeneousModel('claude-code', 'gpt-5.4')).rejects.toThrow(
+      'not compatible with this heterogeneous agent',
+    );
+    await expect(resolveServerDefaultHeterogeneousModel('kimi-code', 'gpt-5.4')).rejects.toThrow(
+      'not compatible with this heterogeneous agent',
+    );
+    await expect(resolveServerDefaultHeterogeneousModel('codex', 'gpt-4o')).rejects.toThrow(
+      'not compatible with this heterogeneous agent',
+    );
+  });
+
+  it('resolves a model-bank model when no explicit server model list exists', async () => {
+    getServerGlobalConfig.mockResolvedValue({
+      aiProvider: {
+        lobehub: { enabled: true, serverModelLists: undefined },
+      },
+    });
+    loadModels.mockResolvedValue([
+      {
+        enabled: true,
+        id: 'claude-sonnet-4-6',
+        providerId: 'lobehub',
+        settings: { extendParams: ['enableAdaptiveThinking'] },
+        source: 'builtin',
+        type: 'chat',
+      },
+    ]);
+
+    await expect(
+      resolveServerDefaultHeterogeneousModel('claude-code', 'claude-sonnet-4-6'),
+    ).resolves.toEqual({
+      model: 'claude-sonnet-4-6',
+      provider: 'lobehub',
+      supportsAdaptiveThinking: true,
+    });
+  });
+
+  it('accepts a tool-capable third-party relay model for Kimi without attestation', async () => {
+    getServerGlobalConfig.mockResolvedValue({
+      aiProvider: {
+        lobehub: {
+          enabled: true,
+          serverModelLists: [
+            {
+              abilities: { functionCall: true },
+              enabled: true,
+              id: 'kimi-k2.6',
+              maxOutput: 65_536,
+              type: 'chat',
+            },
+            { abilities: { reasoning: true }, enabled: true, id: 'no-tools-model', type: 'chat' },
+          ],
+        },
+      },
+    });
+
+    await expect(
+      resolveServerDefaultHeterogeneousModel('claude-code', 'kimi-k2.6'),
+    ).resolves.toEqual({
+      maxOutput: 65_536,
+      model: 'kimi-k2.6',
+      provider: 'lobehub',
+      supportsAdaptiveThinking: false,
+    });
+    await expect(
+      resolveServerDefaultHeterogeneousModel('kimi-code', 'kimi-k2.6'),
+    ).resolves.toMatchObject({ maxOutput: 65_536, model: 'kimi-k2.6', provider: 'lobehub' });
+    await expect(resolveServerDefaultHeterogeneousModel('pi', 'kimi-k2.6')).resolves.toMatchObject({
+      model: 'kimi-k2.6',
+      provider: 'lobehub',
+    });
+    await expect(
+      resolveServerDefaultHeterogeneousModel('grok-build', 'kimi-k2.6'),
+    ).resolves.toMatchObject({ model: 'kimi-k2.6', provider: 'lobehub' });
+    await expect(
+      resolveServerDefaultHeterogeneousModel('trae', 'kimi-k2.6'),
+    ).resolves.toMatchObject({ model: 'kimi-k2.6', provider: 'lobehub' });
+
+    await expect(resolveServerDefaultHeterogeneousModel('codex', 'kimi-k2.6')).rejects.toThrow(
+      'not compatible with this heterogeneous agent',
+    );
+    await expect(
+      resolveServerDefaultHeterogeneousModel('claude-code', 'no-tools-model'),
+    ).rejects.toThrow('not compatible with this heterogeneous agent');
+  });
+
+  it('keeps hidden runtime aliases resolvable but rejects them for heterogeneous agents', async () => {
+    getServerGlobalConfig.mockResolvedValue({
+      aiProvider: {
+        lobehub: {
+          enabled: true,
+          serverModelLists: [
+            {
+              abilities: { functionCall: true },
+              enabled: true,
+              id: 'lobehub-onboarding-v1',
+              type: 'chat',
+              visible: false,
+            },
+          ],
+        },
+      },
+    });
+
+    await expect(resolveServerModel('lobehub', 'lobehub-onboarding-v1')).resolves.toEqual({
+      model: 'lobehub-onboarding-v1',
+      provider: 'lobehub',
+    });
+    await expect(
+      resolveServerDefaultHeterogeneousModel('claude-code', 'lobehub-onboarding-v1'),
+    ).rejects.toThrow('not compatible with this heterogeneous agent');
+  });
+
+  it('preserves the deployment model mapping for a relay selection', async () => {
+    getServerGlobalConfig.mockResolvedValue({
+      aiProvider: {
+        lobehub: {
+          enabled: true,
+          serverModelLists: [
+            {
+              abilities: { functionCall: true },
+              config: { deploymentName: 'kimi-prod' },
+              enabled: true,
+              id: 'kimi-k2.6',
+              type: 'chat',
+            },
+          ],
+        },
+      },
+    });
+
+    await expect(
+      resolveServerDefaultHeterogeneousModel('claude-code', 'kimi-k2.6'),
+    ).resolves.toEqual({
+      deploymentName: 'kimi-prod',
+      model: 'kimi-k2.6',
+      provider: 'lobehub',
+      supportsAdaptiveThinking: false,
+    });
+  });
+});
+
+describe('initModelRuntimeFromServerConfig', () => {
+  it('initializes the LobeHub router directly without protocol-provider credentials', async () => {
+    const runtime = {} as ModelRuntime;
+    const initialize = vi.spyOn(ModelRuntime, 'initializeWithProvider').mockReturnValue(runtime);
+
+    await expect(
+      initModelRuntimeFromServerConfig({ actorUserId: 'user-1', workspaceId: 'workspace-1' }),
+    ).resolves.toBe(runtime);
+
+    expect(initialize).toHaveBeenCalledWith(
+      ModelProvider.LobeHub,
+      { userId: 'user-1', workspaceId: 'workspace-1' },
+      expect.anything(),
+    );
+    initialize.mockRestore();
+  });
+});
+
 /**
  * Test cases for function initModelRuntimeWithUserPayload
  * this method will use ModelRuntime from `@lobechat/model-runtime`
@@ -69,12 +700,30 @@ describe('initModelRuntimeWithUserPayload method', () => {
     it('OpenAI provider: with apikey and endpoint', async () => {
       const jwtPayload: ClientSecretPayload = {
         apiKey: 'user-openai-key',
-        baseURL: 'user-endpoint',
+        baseURL: 'https://user-endpoint.test/v1',
       };
       const runtime = await initModelRuntimeWithUserPayload(ModelProvider.OpenAI, jwtPayload);
       expect(runtime).toBeInstanceOf(ModelRuntime);
       expect(runtime['_runtime']).toBeInstanceOf(LobeOpenAI);
       expect(runtime['_runtime'].baseURL).toBe(jwtPayload.baseURL);
+    });
+
+    it('rejects an invalid user baseURL as a bad request before SDK initialization', () => {
+      let thrownError: unknown;
+
+      try {
+        initModelRuntimeWithUserPayload(ModelProvider.OpenAI, {
+          apiKey: 'user-openai-key',
+          baseURL: 'https://api.example.com /v1/chat/completions',
+        });
+      } catch (error) {
+        thrownError = error;
+      }
+
+      expect(thrownError).toEqual({
+        error: { message: 'Invalid provider baseURL' },
+        errorType: ChatErrorType.BadRequest,
+      });
     });
 
     it('Azure AI provider: with apikey, endpoint and apiversion', async () => {
@@ -170,6 +819,55 @@ describe('initModelRuntimeWithUserPayload method', () => {
       const runtime = await initModelRuntimeWithUserPayload(ModelProvider.Bedrock, jwtPayload);
       expect(runtime).toBeInstanceOf(ModelRuntime);
       expect(runtime['_runtime']).toBeInstanceOf(LobeBedrockAI);
+    });
+
+    it('Bedrock AI provider: with API key only', async () => {
+      const jwtPayload: ClientSecretPayload = {
+        apiKey: 'user-bedrock-api-key',
+        awsRegion: 'us-east-1',
+      };
+      const runtime = await initModelRuntimeWithUserPayload(ModelProvider.Bedrock, jwtPayload);
+
+      expect(runtime).toBeInstanceOf(ModelRuntime);
+      expect(runtime['_runtime']).toBeInstanceOf(LobeBedrockAI);
+    });
+
+    it('Bedrock AI provider: picks one API key with server key selection', async () => {
+      const apiKey = 'user-bedrock-api-key-a,user-bedrock-api-key-b';
+      const jwtPayload: ClientSecretPayload = {
+        apiKey,
+        awsRegion: 'us-east-1',
+      };
+      const runtime = await initModelRuntimeWithUserPayload(ModelProvider.Bedrock, jwtPayload);
+      const bedrockRuntime = runtime['_runtime'] as unknown as InspectableBedrockRuntime;
+      const token = await bedrockRuntime.client.config.token?.();
+
+      expect(apiKey.split(',')).toContain(token?.token);
+    });
+
+    it('Bedrock AI provider: with legacy AWS credentials only', async () => {
+      const jwtPayload: ClientSecretPayload = {
+        awsAccessKeyId: 'user-aws-id',
+        awsSecretAccessKey: 'user-aws-secret',
+        awsRegion: 'user-aws-region',
+      };
+      const runtime = await initModelRuntimeWithUserPayload(ModelProvider.Bedrock, jwtPayload);
+
+      expect(runtime).toBeInstanceOf(ModelRuntime);
+      expect(runtime['_runtime']).toBeInstanceOf(LobeBedrockAI);
+    });
+
+    it('Bedrock AI provider: falls back to env credentials when only region is provided', async () => {
+      const jwtPayload: ClientSecretPayload = {
+        awsRegion: 'custom-aws-region',
+      };
+      const runtime = await initModelRuntimeWithUserPayload(ModelProvider.Bedrock, jwtPayload);
+
+      expect(runtime).toBeInstanceOf(ModelRuntime);
+      expect(runtime['_runtime']).toBeInstanceOf(LobeBedrockAI);
+      expect((runtime['_runtime'] as unknown as InspectableBedrockRuntime).region).toBe(
+        'custom-aws-region',
+      );
     });
 
     it('Ollama provider: with endpoint', async () => {
@@ -296,7 +994,7 @@ describe('initModelRuntimeWithUserPayload method', () => {
     it('Unknown Provider: with apikey and endpoint, should initialize to OpenAi', async () => {
       const jwtPayload: ClientSecretPayload = {
         apiKey: 'user-unknown-key',
-        baseURL: 'user-unknown-endpoint',
+        baseURL: 'https://user-unknown-endpoint.test/v1',
       };
       const runtime = await initModelRuntimeWithUserPayload('unknown', jwtPayload);
       expect(runtime).toBeInstanceOf(ModelRuntime);
@@ -518,6 +1216,20 @@ describe('buildPayloadFromKeyVaults', () => {
       });
     });
 
+    it('ChatGPT: returns the OAuth access token and account id', () => {
+      const keyVaults = {
+        oauthAccessToken: 'oauth-access-token',
+        oauthAccountId: 'chatgpt-account-id',
+      };
+      const payload = buildPayloadFromKeyVaults(keyVaults, ModelProvider.ChatGPT);
+
+      expect(payload).toEqual({
+        apiKey: 'oauth-access-token',
+        chatgptAccountId: 'chatgpt-account-id',
+        runtimeProvider: ModelProvider.ChatGPT,
+      });
+    });
+
     it('Azure: returns apiKey, baseURL and runtimeProvider', () => {
       const keyVaults = {
         apiKey: 'azure-api-key',
@@ -569,11 +1281,28 @@ describe('buildPayloadFromKeyVaults', () => {
       const payload = buildPayloadFromKeyVaults(keyVaults, ModelProvider.Bedrock);
 
       expect(payload).toEqual({
-        apiKey: 'aws-secret-keyaws-access-key',
+        apiKey: undefined,
         awsAccessKeyId: 'aws-access-key',
         awsRegion: 'us-east-1',
         awsSecretAccessKey: 'aws-secret-key',
         awsSessionToken: 'session-token',
+        runtimeProvider: ModelProvider.Bedrock,
+      });
+    });
+
+    it('Bedrock: returns API key and runtimeProvider', () => {
+      const keyVaults = {
+        apiKey: 'bedrock-api-key',
+        region: 'us-east-1',
+      };
+      const payload = buildPayloadFromKeyVaults(keyVaults, ModelProvider.Bedrock);
+
+      expect(payload).toEqual({
+        apiKey: 'bedrock-api-key',
+        awsAccessKeyId: undefined,
+        awsRegion: 'us-east-1',
+        awsSecretAccessKey: undefined,
+        awsSessionToken: undefined,
         runtimeProvider: ModelProvider.Bedrock,
       });
     });

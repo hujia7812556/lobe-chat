@@ -1,3 +1,5 @@
+import type { TopicCommentItem } from '@lobechat/types';
+
 import { type PortalArtifact } from '@/types/artifact';
 
 export enum ArtifactDisplayMode {
@@ -8,16 +10,30 @@ export enum ArtifactDisplayMode {
 // ============== Portal View Stack Types ==============
 
 export enum PortalViewType {
+  Acceptance = 'acceptance',
+  AcceptanceCheck = 'acceptanceCheck',
+  AgentDetail = 'agentDetail',
   Artifact = 'artifact',
   Document = 'document',
   FilePreview = 'filePreview',
+  Goal = 'goal',
+  GoalMetric = 'goalMetric',
+  GoalNode = 'goalNode',
+  GoalReport = 'goalReport',
+  GoalReportChapter = 'goalReportChapter',
   GroupThread = 'groupThread',
   Home = 'home',
   LocalFile = 'localFile',
   MessageDetail = 'messageDetail',
   Notebook = 'notebook',
+  TaskDetail = 'taskDetail',
+  TaskResult = 'taskResult',
   Thread = 'thread',
   ToolUI = 'toolUI',
+  Topic = 'topic',
+  TopicComments = 'topicComments',
+  TopicCommentThread = 'topicCommentThread',
+  VerifyReport = 'verifyReport',
   VerifyResult = 'verifyResult',
 }
 
@@ -31,6 +47,13 @@ export interface OpenLocalFileParams {
   allowExternalFilePreview?: boolean;
   deviceId?: string;
   filePath: string;
+  /**
+   * Present when the file lives in the topic's cloud sandbox instead of a local
+   * or device filesystem: content is fetched live via the sandbox
+   * `readLocalFile` tool scoped to this topic, read-only, and unavailable once
+   * the sandbox is recycled.
+   */
+  sandboxTopicId?: string;
   workingDirectory: string;
 }
 
@@ -38,8 +61,24 @@ export interface OpenLocalFileEntry extends OpenLocalFileParams {
   id: string;
 }
 
+/**
+ * Which header metric of the goal detail page a drill-down inspects. Every
+ * value is derivable from the `goal.graph` snapshot the page already holds —
+ * none of these views require server work.
+ */
+export type GoalMetricKind =
+  'budget' | 'duration' | 'findings' | 'lifecycle' | 'liveness' | 'tasks';
+
 export type PortalViewData =
   | { type: PortalViewType.Home }
+  | { goalId: string; type: PortalViewType.Goal }
+  | { goalId: string; metric: GoalMetricKind; type: PortalViewType.GoalMetric }
+  | { goalId: string; nodeId: string; type: PortalViewType.GoalNode }
+  | { goalId: string; type: PortalViewType.GoalReport }
+  | { chapterIndex: number; goalId: string; type: PortalViewType.GoalReportChapter }
+  | { acceptanceId: string; type: PortalViewType.Acceptance }
+  | { acceptanceId: string; checkId: string; type: PortalViewType.AcceptanceCheck }
+  | { agentId: string; type: PortalViewType.AgentDetail }
   | { artifact: PortalArtifact; type: PortalViewType.Artifact }
   | { agentDocumentId?: string; documentId: string; type: PortalViewType.Document }
   | { type: PortalViewType.Notebook }
@@ -53,7 +92,20 @@ export type PortalViewData =
       type: PortalViewType.ToolUI;
     }
   | { startMessageId?: string; threadId?: string; type: PortalViewType.Thread }
+  | { topicId: string; type: PortalViewType.Topic }
   | { agentId: string; type: PortalViewType.GroupThread }
+  | { taskId: string; type: PortalViewType.TaskDetail }
+  | { taskId: string; type: PortalViewType.TaskResult }
+  | {
+      focusCommentId?: string;
+      initialReplyCount?: number;
+      initialRoot?: TopicCommentItem;
+      rootCommentId: string;
+      topicId: string;
+      type: PortalViewType.TopicCommentThread;
+    }
+  | { messageId?: string; topicId: string; type: PortalViewType.TopicComments }
+  | { runId: string; type: PortalViewType.VerifyReport }
   | { checkItemId: string; operationId: string; type: PortalViewType.VerifyResult };
 
 // ============== Portal State ==============

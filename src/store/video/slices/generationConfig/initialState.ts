@@ -1,12 +1,12 @@
 /* eslint-disable perfectionist/sort-interfaces */
+import { ModelProvider } from 'model-bank/modelProvider';
 import {
   extractVideoDefaultValues,
-  ModelProvider,
   PRESET_VIDEO_ASPECT_RATIOS,
   PRESET_VIDEO_RESOLUTIONS,
   type RuntimeVideoGenParams,
   type VideoModelParamsSchema,
-} from 'model-bank';
+} from 'model-bank/standardParameters';
 
 export const DEFAULT_AI_VIDEO_PROVIDER = ModelProvider.LobeHub;
 export const DEFAULT_AI_VIDEO_MODEL = 'dreamina-seedance-2-0-260128';
@@ -50,6 +50,13 @@ export interface VideoGenerationConfigState {
   model: string;
 
   /**
+   * Object-URL previews for reference images currently being uploaded. Shared
+   * across the inline reference frames and the page-level drag-upload zone so
+   * both surfaces show the same in-flight loading placeholders.
+   */
+  uploadingImagePreviews: string[];
+
+  /**
    * Marks whether the configuration has been initialized (including restoration from memory)
    */
   isInit: boolean;
@@ -63,5 +70,6 @@ export const initialGenerationConfigState: VideoGenerationConfigState = {
   provider: DEFAULT_AI_VIDEO_PROVIDER,
   parameters: DEFAULT_VIDEO_GENERATION_PARAMETERS,
   parametersSchema: seedance20Params,
+  uploadingImagePreviews: [],
   isInit: false,
 };

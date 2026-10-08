@@ -1,4 +1,5 @@
 import { ENABLE_BUSINESS_FEATURES } from '@lobechat/business-const';
+import { parseToolNameMaxLength } from '@lobechat/const/plugin';
 import { ModelProvider } from 'model-bank';
 
 import { composioEnv } from '@/config/composio';
@@ -22,6 +23,7 @@ import {
 import { parseAgentConfig } from './parseDefaultAgent';
 import { parseFilesConfig } from './parseFilesConfig';
 import { getPublicMemoryExtractionConfig } from './parseMemoryExtractionConfig';
+import { getServerFetchOnClientOverride } from './serverFetchOnClient';
 
 /**
  * Get Better-Auth SSO providers list
@@ -29,6 +31,24 @@ import { getPublicMemoryExtractionConfig } from './parseMemoryExtractionConfig';
  */
 const getBetterAuthSSOProviders = () => {
   return parseSSOProviders(authEnv.AUTH_SSO_PROVIDERS);
+};
+
+/**
+ * Which Agent Gateway wire protocol the client may dial.
+ *
+ * The multiplexed `/v2/ws` socket only exists on the gateway that ships with
+ * business builds. A self-hosted deployment runs `lobehub/lobehub-gateway`,
+ * which serves `GET /ws` and nothing else — a client that picks v2 there only
+ * reaches a working socket after burning its dial budget on 404s, so the
+ * default has to be the one that works everywhere. `AGENT_GATEWAY_PROTOCOL`
+ * overrides both guesses, which is what an on-prem business deployment sitting
+ * in front of a v1 gateway needs.
+ */
+const resolveAgentGatewayProtocol = (): 1 | 2 => {
+  if (appEnv.AGENT_GATEWAY_PROTOCOL === 2) return 2;
+  if (appEnv.AGENT_GATEWAY_PROTOCOL === 1) return 1;
+
+  return ENABLE_BUSINESS_FEATURES ? 2 : 1;
 };
 
 export const getServerGlobalConfig = async () => {
@@ -57,11 +77,11 @@ export const getServerGlobalConfig = async () => {
       withDeploymentName: true,
     },
     lmstudio: {
-      fetchOnClient: isDesktop ? false : undefined,
+      fetchOnClient: getServerFetchOnClientOverride('lmstudio'),
     },
     ollama: {
       enabled: isDesktop ? true : undefined,
-      fetchOnClient: isDesktop ? false : !process.env.OLLAMA_PROXY_URL,
+      fetchOnClient: getServerFetchOnClientOverride('ollama'),
     },
     ollamacloud: {
       enabledKey: 'ENABLED_OLLAMA_CLOUD',
@@ -75,6 +95,9 @@ export const getServerGlobalConfig = async () => {
     tencentcloud: {
       enabledKey: 'ENABLED_TENCENT_CLOUD',
       modelListKey: 'TENCENT_CLOUD_MODEL_LIST',
+    },
+    unsloth: {
+      fetchOnClient: getServerFetchOnClientOverride('unsloth'),
     },
     volcengine: {
       withDeploymentName: true,
@@ -113,20 +136,21 @@ export const getServerGlobalConfig = async () => {
       appEnv.MARKET_TRUSTED_CLIENT_SECRET && appEnv.MARKET_TRUSTED_CLIENT_ID
     ),
     enableUploadFileToServer: !!fileEnv.S3_SECRET_ACCESS_KEY,
-    enableVisualUnderstanding: !!(
-      toolsEnv.VISUAL_UNDERSTANDING_PROVIDER && toolsEnv.VISUAL_UNDERSTANDING_MODEL
+    enableMultimodalUnderstanding: !!(
+      toolsEnv.MULTIMODAL_UNDERSTANDING_PROVIDER && toolsEnv.MULTIMODAL_UNDERSTANDING_MODEL
     ),
-    ...(toolsEnv.VISUAL_UNDERSTANDING_PROVIDER && toolsEnv.VISUAL_UNDERSTANDING_MODEL
+    ...(toolsEnv.MULTIMODAL_UNDERSTANDING_PROVIDER && toolsEnv.MULTIMODAL_UNDERSTANDING_MODEL
       ? {
-          visualUnderstanding: {
-            model: toolsEnv.VISUAL_UNDERSTANDING_MODEL,
-            provider: toolsEnv.VISUAL_UNDERSTANDING_PROVIDER,
+          multimodalUnderstanding: {
+            model: toolsEnv.MULTIMODAL_UNDERSTANDING_MODEL,
+            provider: toolsEnv.MULTIMODAL_UNDERSTANDING_PROVIDER,
           },
         }
       : undefined),
 
     // Expose Agent Gateway URL to client (used by hetero agents; also required for queue mode)
     ...(appEnv.AGENT_GATEWAY_URL ? { agentGatewayUrl: appEnv.AGENT_GATEWAY_URL } : undefined),
+    agentGatewayProtocol: resolveAgentGatewayProtocol(),
 
     image: cleanObject({
       defaultImageNum: imageEnv.AI_IMAGE_DEFAULT_IMAGE_NUM,
@@ -139,6 +163,12 @@ export const getServerGlobalConfig = async () => {
     telemetry: {
       langfuse: langfuseEnv.ENABLE_LANGFUSE,
     },
+    // The client-driven chat path generates tool names in the browser, so the
+    // server-only `TOOL_NAME_MAX_LENGTH` has to travel with the config for `0`
+    // (compression off) to have any effect outside gateway mode. Parsed with the
+    // resolver's own function so both sides read the raw value identically —
+    // unset/invalid stays `undefined`, i.e. the resolver's default 64.
+    toolNameMaxLength: parseToolNameMaxLength(toolsEnv.TOOL_NAME_MAX_LENGTH),
   };
 
   return config;

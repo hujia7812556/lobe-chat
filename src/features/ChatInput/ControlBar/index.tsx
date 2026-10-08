@@ -1,19 +1,26 @@
-import { Flexbox, Skeleton } from '@lobehub/ui';
+import { Flexbox } from '@lobehub/ui';
+import { Skeleton } from '@lobehub/ui/base-ui';
 import { createStaticStyles } from 'antd-style';
 import { memo } from 'react';
 
+import ChatInputCredits from '@/business/client/features/ChatInputCredits';
 import { useAgentStore } from '@/store/agent';
 import { agentByIdSelectors } from '@/store/agent/selectors';
 
 import ContextWindow from '../ActionBar/Token';
 import { useAgentId } from '../hooks/useAgentId';
+import { useChatInputResourceAccess } from '../hooks/useChatInputResourceAccess';
+import { useEffectiveAgentMode } from '../hooks/useEffectiveAgentMode';
 import { useChatInputStore } from '../store';
 import ApprovalMode from './ApprovalMode';
 import ModeSelector from './ModeSelector';
 import WorkspaceControls from './WorkspaceControls';
 
 const styles = createStaticStyles(({ css }) => ({
+  // `flex: none` keeps the row at 28px inside the column-flex composer; without
+  // it the bar shrinks to the compact chips' min-content height.
   bar: css`
+    flex: none;
     height: 28px;
     padding-block: 0;
     padding-inline: 4px;
@@ -40,21 +47,22 @@ const styles = createStaticStyles(({ css }) => ({
 
 const ControlBar = memo(() => {
   const agentId = useAgentId();
+  const { canShowControls } = useChatInputResourceAccess();
   const showContextWindow = useChatInputStore((s) =>
     s.rightActions.flat().includes('contextWindow'),
   );
 
-  const [isLoading, enableAgentMode] = useAgentStore((s) => [
-    agentByIdSelectors.isAgentConfigLoadingById(agentId)(s),
-    agentByIdSelectors.getAgentEnableModeById(agentId)(s),
-  ]);
+  const isLoading = useAgentStore((s) => agentByIdSelectors.isAgentConfigLoadingById(agentId)(s));
+  const { isAgentRuntimeMode, isPreferenceLoading } = useEffectiveAgentMode(agentId);
+
+  if (!canShowControls || isPreferenceLoading) return null;
 
   // Skeleton placeholder to prevent layout jump during loading
   if (!agentId || isLoading) {
     return (
       <Flexbox horizontal align={'center'} className={styles.bar} gap={4}>
-        <Skeleton.Button active size="small" style={{ height: 22, minWidth: 64, width: 64 }} />
-        <Skeleton.Button active size="small" style={{ height: 22, minWidth: 100, width: 100 }} />
+        <Skeleton style={{ height: 22, minWidth: 64, width: 64 }} />
+        <Skeleton style={{ height: 22, minWidth: 100, width: 100 }} />
       </Flexbox>
     );
   }
@@ -64,11 +72,12 @@ const ControlBar = memo(() => {
       {/* Left: chat-mode switcher + (agent-only) execution device + working directory */}
       <Flexbox horizontal align={'center'} className={styles.leftGroup} gap={4}>
         <ModeSelector />
-        {enableAgentMode && <WorkspaceControls agentId={agentId} />}
+        {isAgentRuntimeMode && <WorkspaceControls agentId={agentId} />}
       </Flexbox>
 
       <Flexbox horizontal align={'center'} className={styles.rightGroup} gap={4}>
-        {enableAgentMode && <ApprovalMode />}
+        <ChatInputCredits />
+        {isAgentRuntimeMode && <ApprovalMode />}
         {showContextWindow && <ContextWindow />}
       </Flexbox>
     </Flexbox>

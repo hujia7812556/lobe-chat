@@ -6,6 +6,8 @@ import {
 import type { ModelRuntimeHooks } from '@lobechat/model-runtime';
 import debug from 'debug';
 
+import { after } from '@/server/utils/scheduleAfterResponse';
+
 import { getLLMGenerationTracingService } from './index';
 
 const log = debug('lobe-server:llm-generation-tracing:hook');
@@ -46,24 +48,6 @@ const extractSystemPrompt = (messages: unknown): string => {
   return '';
 };
 
-const tryScheduleAfter = (work: () => Promise<void> | void): void => {
-  let scheduled = false;
-  try {
-    const nextServer = require('next/server') as { after?: (fn: () => unknown) => void };
-    if (typeof nextServer.after === 'function') {
-      nextServer.after(work);
-      scheduled = true;
-    }
-  } catch {
-    // next/server not available — fall through to fire-and-forget
-  }
-  if (!scheduled) {
-    Promise.resolve()
-      .then(work)
-      .catch((err) => log('Deferred tracing work threw: %O', err));
-  }
-};
-
 /**
  * Build a `ModelRuntimeHooks` slice that records every `generateObject` call to
  * the `llm_generation_tracing` DB table + blob store. Designed to be merged
@@ -82,7 +66,7 @@ export const createLLMGenerationTracingHook = (
       const tracing = parseTracingOptions(context.options?.tracing as Record<string, unknown>);
       // `trigger` is also read by ModelRuntime itself (timing logs) so it
       // legitimately lives on `metadata`. Honour the explicit `tracing.trigger`
-      // override but fall back to the cross-cutting `metadata.trigger`.
+      // override but fall back to the cross-cutting `origin.trigger`.
       const metadataTrigger = pickString(
         (context.options?.metadata as Record<string, unknown> | undefined)?.trigger,
       );
@@ -111,7 +95,7 @@ export const createLLMGenerationTracingHook = (
           ? (rawTracing.onPersisted as (tracingId: string | null) => void | Promise<void>)
           : undefined;
 
-      tryScheduleAfter(async () => {
+      after(async () => {
         let persistedTracingId: string | null = null;
         try {
           const result = await service.record({

@@ -7,6 +7,7 @@ import { TaskModel } from '@/database/models/task';
 import { TaskTopicModel } from '@/database/models/taskTopic';
 import { tasks } from '@/database/schemas';
 import { getServerDB } from '@/database/server';
+import { notTrashed } from '@/database/utils/softDelete';
 
 import { TaskRunnerService } from './index';
 
@@ -16,8 +17,7 @@ const TERMINAL_STATUSES = new Set(['canceled', 'completed', 'failed']);
 const isTerminal = (status: string) => TERMINAL_STATUSES.has(status);
 
 export type ScheduleTickOutcome =
-  | { ran: true; taskIdentifier: string }
-  | { ran: false; reason: ScheduleTickSkipReason };
+  { ran: true; taskIdentifier: string } | { ran: false; reason: ScheduleTickSkipReason };
 
 export type ScheduleTickSkipReason =
   | 'human-waiting'
@@ -49,7 +49,9 @@ export async function runScheduleTick(
   const [task] = await db
     .select()
     .from(tasks)
-    .where(and(eq(tasks.id, taskId), eq(tasks.createdByUserId, userId)))
+    .where(
+      and(eq(tasks.id, taskId), eq(tasks.createdByUserId, userId), notTrashed(tasks.isDeleted)),
+    )
     .limit(1);
   if (!task) {
     log('skip task=%s reason=not-found', taskId);
@@ -74,7 +76,7 @@ export async function runScheduleTick(
   }
 
   const briefModel = new BriefModel(db, userId, wsId);
-  if (await briefModel.hasUnresolvedUrgentByTask(taskId)) {
+  if (await briefModel.hasUnresolvedUrgentByTask(taskId, { excludeTypes: ['error'] })) {
     log('skip task=%s reason=human-waiting', taskId);
     return { ran: false, reason: 'human-waiting' };
   }
@@ -101,7 +103,12 @@ export async function runScheduleTick(
     if (startedAtIso) {
       const startedAt = new Date(startedAtIso);
       const topicModel = new TaskTopicModel(db, userId, wsId);
-      const runCount = await topicModel.countByTask(taskId, { since: startedAt });
+      // Only automation ticks count against the quota — ad-hoc manual runs must
+      // not consume scheduled executions.
+      const runCount = await topicModel.countByTask(taskId, {
+        since: startedAt,
+        triggers: ['schedule'],
+      });
       if (runCount >= maxExecutions) {
         log(
           'skip task=%s reason=max-executions-reached (%d/%d) — marking completed',
@@ -118,7 +125,7 @@ export async function runScheduleTick(
 
   const runner = new TaskRunnerService(db, userId, wsId);
   try {
-    await runner.runTask({ taskId });
+    await runner.runTask({ taskId, trigger: 'schedule' });
   } catch (e) {
     // Concurrent tick / manual run already running this task — graceful skip.
     if (e instanceof TRPCError && e.code === 'CONFLICT') {

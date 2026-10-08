@@ -1,12 +1,10 @@
 import { mutate } from '@/libs/swr';
+import { portalKeys } from '@/libs/swr/keys';
 
 import { agentDocumentSWRKeys, documentSWRKeys, notebookSWRKeys } from './swrKeys';
 
 export type DocumentMutationCause =
-  | 'agent-document'
-  | 'document-service'
-  | 'notebook'
-  | 'page-title';
+  'agent-document' | 'document-service' | 'notebook' | 'page-title';
 
 export interface InvalidateDocumentMutationParams {
   agentDocumentId?: string;
@@ -37,6 +35,7 @@ export const invalidateDocumentMutation = async (
     }
     revalidations.push(mutate(documentSWRKeys.pageDetail(documentId)));
     revalidations.push(mutate(documentSWRKeys.pageMeta(documentId)));
+    revalidations.push(mutate(portalKeys.documentHeader(documentId)));
   }
 
   if (documentId || refreshPageDocuments) {
@@ -49,7 +48,13 @@ export const invalidateDocumentMutation = async (
 
   if (agentId) {
     revalidations.push(mutate(agentDocumentSWRKeys.documents(agentId)));
-    revalidations.push(mutate(agentDocumentSWRKeys.documentsList(agentId)));
+    // Prefix match so every `agent:documentsList` variant (full list + the
+    // `non-web` hot-path variant, in both personal and workspace scope where the
+    // workspace id is appended) revalidates together. The scoped `mutate` passes
+    // function keys through untouched, so this predicate sees the real cache key.
+    revalidations.push(
+      mutate((key) => Array.isArray(key) && key[0] === 'agent:documentsList' && key[1] === agentId),
+    );
   }
 
   if (agentId && agentDocumentId) {

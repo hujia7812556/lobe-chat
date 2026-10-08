@@ -1,8 +1,11 @@
 'use client';
 
+import { Center } from '@lobehub/ui';
 import { memo, useCallback, useMemo } from 'react';
 
 import { useCommunityWorkspaceProfile } from '@/business/client/hooks/useCommunityWorkspaceProfile';
+import AsyncError from '@/components/AsyncError';
+import { RouteLoading } from '@/components/Skeleton/RouteSegment';
 import { useWorkspaceAwareNavigate } from '@/features/Workspace/useWorkspaceAwareNavigate';
 import { useDiscoverStore } from '@/store/discover';
 import type { DiscoverUserProfile } from '@/types/discover';
@@ -16,7 +19,6 @@ import {
 } from './features/resolveWorkspaceProfileEdit';
 import WorkspaceContent from './features/WorkspaceContent';
 import { openWorkspaceProfileModal } from './features/WorkspaceProfileModal';
-import Loading from './loading';
 
 interface WorkspaceDetailPageProps {
   mobile?: boolean;
@@ -39,6 +41,7 @@ const WorkspaceDetailPage = memo<WorkspaceDetailPageProps>(({ mobile }) => {
   const useUserProfile = useDiscoverStore((s) => s.useUserProfile);
   const {
     data,
+    error: userProfileError,
     isLoading: isUserProfileLoading,
     mutate,
   } = useUserProfile({
@@ -148,8 +151,25 @@ const WorkspaceDetailPage = memo<WorkspaceDetailPageProps>(({ mobile }) => {
     profileData,
   ]);
 
-  if ((isWorkspaceProfileLoading || isUserProfileLoading) && !fallbackProfile) return <Loading />;
-  if (!contextConfig) return <NotFound />;
+  if ((isWorkspaceProfileLoading || isUserProfileLoading) && !fallbackProfile)
+    return <RouteLoading />;
+  if (!contextConfig) {
+    // A transient profile fetch failure must not masquerade as "workspace not
+    // found" — offer Reload. Only a resolved-empty profile is a real 404
+    // `fallbackProfile` would have yielded a contextConfig, so
+    // reaching here with an error means we have nothing to show.
+    if (userProfileError)
+      return (
+        <Center flex={1} padding={48} width={'100%'}>
+          <AsyncError
+            error={userProfileError}
+            variant={'page'}
+            onRetry={() => handleRefreshWorkspaceProfile()}
+          />
+        </Center>
+      );
+    return <NotFound />;
+  }
 
   return (
     <WorkspaceDetailProvider config={contextConfig}>
@@ -159,8 +179,8 @@ const WorkspaceDetailPage = memo<WorkspaceDetailPageProps>(({ mobile }) => {
   );
 });
 
-export const MobileWorkspaceDetailPage = memo(() => {
+export const MobileWorkspaceDetailPage = () => {
   return <WorkspaceDetailPage mobile={true} />;
-});
+};
 
 export default WorkspaceDetailPage;

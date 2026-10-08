@@ -34,9 +34,10 @@ const currentActiveThread = (s: ChatStoreState): ThreadItem | undefined => {
 
 const isActiveThreadSubagent = (s: ChatStoreState): boolean => {
   const thread = currentActiveThread(s);
-  // Isolation threads (CC subagents + lobe-agent sub-agents) are driven by the
-  // parent agent, so the thread view is read-only regardless of origin.
-  return thread?.type === ThreadType.Isolation;
+  // Only tool-spawned subagent threads are externally owned and read-only.
+  // Direct @Agent isolation threads are ordinary target-Agent conversations
+  // after the delegated run completes, so users can continue chatting there.
+  return !!thread?.metadata?.sourceToolCallId;
 };
 
 const getThreadsByTopic = (topicId?: string) => (s: ChatStoreState) => {
@@ -49,6 +50,14 @@ const getThreadsBySourceMsgId = (id: string) => (s: ChatStoreState) => {
   const threads = currentTopicThreads(s);
 
   return threads.filter((t) => t.sourceMessageId === id);
+};
+
+const getIsolationThreadBySourceMsgId = (id: string) => (s: ChatStoreState) => {
+  const threads = currentTopicThreads(s);
+
+  return threads.find(
+    (thread) => thread.sourceMessageId === id && thread.type === ThreadType.Isolation,
+  );
 };
 
 const hasThreadBySourceMsgId = (id: string) => (s: ChatStoreState) => {
@@ -77,6 +86,20 @@ const getMainScopeMessages = (s: ChatStoreState): UIChatMessage[] => {
 };
 
 /**
+ * Raw main-scope rows, the same key as `getMainScopeMessages` but before conversation-flow
+ * grouped them for display.
+ */
+const getMainScopeDbMessages = (s: ChatStoreState): UIChatMessage[] => {
+  if (!s.activeAgentId) return [];
+  const mainKey = messageMapKey({
+    agentId: s.activeAgentId,
+    groupId: s.activeGroupId,
+    topicId: s.activeTopicId,
+  });
+  return (s.dbMessagesMap?.[mainKey] || []) as UIChatMessage[];
+};
+
+/**
  * Internal helper to get parent messages for a thread
  */
 const getThreadParentMessages = (s: ChatStoreState, data: UIChatMessage[]) => {
@@ -94,11 +117,15 @@ const getThreadParentMessages = (s: ChatStoreState, data: UIChatMessage[]) => {
 
 /**
  * Get thread child messages by thread ID
+ *
+ * Reads the raw main-scope rows rather than `messagesMap`: the rendered shape is the main
+ * transcript, which deliberately leaves threads out, so a thread's replies only exist here
+ * in `dbMessagesMap`.
  */
 const getThreadChildMessages =
   (id?: string) =>
   (s: ChatStoreState): UIChatMessage[] => {
-    const data = getMainScopeMessages(s);
+    const data = getMainScopeDbMessages(s);
     return data.filter((m) => !!id && m.threadId === id);
   };
 
@@ -167,6 +194,7 @@ export const threadSelectors = {
   currentTopicThreads,
   getThreadChildMessages,
   getThreadDbMessages,
+  getIsolationThreadBySourceMsgId,
   getThreadsBySourceMsgId,
   getThreadsByTopic,
   hasThreadBySourceMsgId,

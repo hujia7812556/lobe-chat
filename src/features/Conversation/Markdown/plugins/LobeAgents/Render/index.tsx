@@ -1,7 +1,8 @@
 'use client';
 
-import { SESSION_CHAT_URL } from '@lobechat/const';
-import { Avatar, Flexbox } from '@lobehub/ui';
+import { AGENT_CHAT_URL } from '@lobechat/const';
+import { Flexbox } from '@lobehub/ui';
+import { Avatar } from '@lobehub/ui/base-ui';
 import { createStaticStyles } from 'antd-style';
 import { ArrowRight } from 'lucide-react';
 import { memo, useCallback } from 'react';
@@ -67,7 +68,7 @@ const Render = memo<LobeAgentsProps>(
 
     const handleClick = useCallback(() => {
       if (!identifier) return;
-      navigate(SESSION_CHAT_URL(identifier));
+      navigate(AGENT_CHAT_URL(identifier));
     }, [navigate, identifier]);
 
     if (!identifier) return null;

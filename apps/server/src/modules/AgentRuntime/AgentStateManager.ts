@@ -2,13 +2,48 @@ import {
   type AgentEvent,
   type AgentRuntimeContext,
   type AgentState,
+  normalizeAgentState,
 } from '@lobechat/agent-runtime';
 import debug from 'debug';
 import { type Redis } from 'ioredis';
 
+import { hasNonPersistedMessage } from './messagePersistence';
 import { getAgentRuntimeRedisClient } from './redis';
 
 const log = debug('lobe-server:agent-runtime:agent-state-manager');
+
+const REFRESH_OWNED_LOCK_SCRIPT =
+  "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('expire', KEYS[1], ARGV[2]) else return 0 end";
+/**
+ * Drop the inline envelope only while this worker still owns the operation lock.
+ *
+ * An unconditional DEL is unsafe: a redelivery can read envelope k, stall while
+ * the active worker finishes k and parks k+1, then lose the lock race and be
+ * told its step is stale. Clearing there would delete a live worker's newer
+ * recovery pointer. Ownership of the lock is exactly the right predicate —
+ * whoever holds it is the worker whose envelope this is.
+ *
+ * KEYS[1] = operation lock, KEYS[2] = inline resume envelope, ARGV[1] = owner.
+ */
+const CLEAR_OWNED_INLINE_RESUME_SCRIPT =
+  "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[2]) else return 0 end";
+const RELEASE_OWNED_LOCK_SCRIPT =
+  "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end";
+/**
+ * Claim the lock, or re-enter it when this exact owner already holds it.
+ *
+ * Re-entry exists for the inline step loop, which runs several steps under one
+ * lock. Owner ids carry a random UUID (see `createStepLockOwner`), so only the
+ * invocation that took the lock can present its owner id — a redelivery from
+ * the queue always mints a different one and still loses the race.
+ */
+const CLAIM_OR_REENTER_LOCK_SCRIPT = `
+if redis.call('set', KEYS[1], ARGV[1], 'EX', ARGV[2], 'NX') then return 1 end
+if redis.call('get', KEYS[1]) == ARGV[1] then
+  redis.call('expire', KEYS[1], ARGV[2])
+  return 1
+end
+return 0`;
 
 export interface StepResult {
   events?: AgentEvent[];
@@ -19,14 +54,44 @@ export interface StepResult {
 }
 
 export interface AgentOperationMetadata {
+  /**
+   * The client that started this operation handles `member_runtime_end`. Only
+   * then does the Gateway stream notifier rename a mirrored group member's
+   * terminal on this operation's channel; a client released before the rename
+   * still gets the verbatim `agent_runtime_end` it retires member columns on.
+   */
+  acceptsMemberRuntimeEnd?: boolean;
   agentConfig?: any;
   createdAt: string;
   lastActiveAt: string;
+  /**
+   * When set, the Gateway stream notifier mirrors this operation's stream events
+   * onto the named operation's Gateway channel as well (single-connection
+   * multiplexing). Used so a broadcast member's streaming events also flow down
+   * the supervisor's existing WebSocket — the supervisor's own operationId —
+   * instead of stranding on a member channel nobody subscribes to.
+   */
+  mirrorToOperationId?: string;
   modelRuntimeConfig?: any;
   status: AgentState['status'];
+  /**
+   * Gateway WS channel owner when it differs from the executing user. For
+   * shared-agent visitor runs the operation EXECUTES as the creator
+   * (`userId`), but only the visitor may subscribe to its stream — the
+   * gateway registers the channel under this id and rejects other subs.
+   */
+  streamOwnerUserId?: string;
   totalCost: number;
   totalSteps: number;
   userId?: string;
+  /**
+   * Visitor-facing redaction policy for a shared-agent visitor run, mirrored
+   * from the share's `AgentShareConfig`. Persisted alongside
+   * {@link streamOwnerUserId} so a queue worker that never ran this op's init
+   * can still apply the OWNER-configured policy instead of falling back to the
+   * fail-closed full strip.
+   */
+  visitorRedaction?: { showErrorDetails?: boolean; showModelInfo?: boolean };
   /**
    * Workspace the operation runs in (null/undefined = personal). Persisted so
    * queue workers (e.g. QStash `runStep`) can reconstruct a workspace-scoped
@@ -41,7 +106,9 @@ export class AgentStateManager {
   private readonly STATE_PREFIX = 'agent_runtime_state';
   private readonly STEPS_PREFIX = 'agent_runtime_steps';
   private readonly METADATA_PREFIX = 'agent_runtime_meta';
-  private readonly EVENTS_PREFIX = 'agent_runtime_events';
+  private readonly INTERRUPT_PREFIX = 'agent_runtime_interrupt';
+  private readonly QUEUED_MESSAGES_PREFIX = 'agent_runtime_queued_messages';
+  private readonly INLINE_RESUME_PREFIX = 'agent_runtime_inline_resume';
   private readonly DEFAULT_TTL = 2 * 3600; // 2h
 
   constructor() {
@@ -53,13 +120,44 @@ export class AgentStateManager {
   }
 
   /**
+   * Serialize an AgentState for Redis persistence, dropping the `messages`
+   * array first.
+   *
+   * `messages` is the dominant size driver of the serialized state — long
+   * topics inline tool results and base64 media, pushing the blob past
+   * Upstash's 10MB single-request limit, which throws and drops the op
+   * outright (StateStorePersistError). It is also fully reconstructible: the
+   * canonical rows live in the DB and every step rehydrates `state.messages`
+   * from there on entry (`AgentRuntimeService.rehydrateStateMessagesFromDB`),
+   * while the few out-of-band readers fall back to a DB query. So we never
+   * serialize it into the persisted blob.
+   *
+   * Keep this in sync with the stream-event strip in `StreamEventManager`
+   * (`stripStateForStream`) and the `done`-event strip in
+   * `OperationTraceRecorder` — all drop the same reconstructible payload.
+   *
+   * Exception: when the working set carries a non-persisted (ephemeral /
+   * suppressed) message — one with no DB row — the array is NOT reconstructible
+   * from a query, so persist it in full. These ops are rare and short-lived
+   * (group-member supervisor turns); the size win is forgone to avoid losing
+   * the prompt.
+   */
+  private serializeStateForPersist(state: AgentState): string {
+    if (hasNonPersistedMessage((state as { messages?: unknown }).messages)) {
+      return JSON.stringify(state);
+    }
+    const { messages: _messages, ...rest } = state as AgentState & { messages?: unknown };
+    return JSON.stringify(rest);
+  }
+
+  /**
    * Save Agent state
    */
   async saveAgentState(operationId: string, state: AgentState): Promise<void> {
     const stateKey = `${this.STATE_PREFIX}:${operationId}`;
 
     try {
-      const serializedState = JSON.stringify(state);
+      const serializedState = this.serializeStateForPersist(state);
       await this.redis.setex(stateKey, this.DEFAULT_TTL, serializedState);
 
       // Update metadata
@@ -92,7 +190,9 @@ export class AgentStateManager {
         return null;
       }
 
-      const state = JSON.parse(serializedState) as AgentState;
+      // Blobs written before the typed `world` / `binding` slots existed carry
+      // that context in `metadata`; lift it once here so readers see one shape.
+      const state = normalizeAgentState(JSON.parse(serializedState) as AgentState);
       log('[%s] Loaded state (step %d)', operationId, state.stepCount);
 
       return state;
@@ -100,6 +200,40 @@ export class AgentStateManager {
       console.error('Failed to load agent state:', error);
       throw error;
     }
+  }
+
+  /**
+   * Set the interrupt sentinel. The full state blob can run to hundreds of
+   * KB (tool manifests, user memory, …), so the step-abort poller checks
+   * this tiny key instead of re-downloading the blob every interval — the
+   * blob's `status: 'interrupted'` stays the authoritative record.
+   */
+  async markInterrupted(operationId: string): Promise<void> {
+    await this.redis.setex(`${this.INTERRUPT_PREFIX}:${operationId}`, this.DEFAULT_TTL, '1');
+  }
+
+  /**
+   * Check the interrupt sentinel without loading the state blob.
+   */
+  async isInterrupted(operationId: string): Promise<boolean> {
+    const exists = await this.redis.exists(`${this.INTERRUPT_PREFIX}:${operationId}`);
+    return exists === 1;
+  }
+
+  /**
+   * Mirror the client's queued-messages flag into a tiny key beside the state,
+   * for the same reason as the interrupt sentinel: the step boundary reads it
+   * without loading the state blob. Clearing deletes the key.
+   */
+  async setQueuedMessages(operationId: string, pending: boolean): Promise<void> {
+    const key = `${this.QUEUED_MESSAGES_PREFIX}:${operationId}`;
+    if (pending) await this.redis.setex(key, this.DEFAULT_TTL, '1');
+    else await this.redis.del(key);
+  }
+
+  async hasQueuedMessages(operationId: string): Promise<boolean> {
+    const exists = await this.redis.exists(`${this.QUEUED_MESSAGES_PREFIX}:${operationId}`);
+    return exists === 1;
   }
 
   /**
@@ -111,7 +245,11 @@ export class AgentStateManager {
     try {
       // Save latest state
       const stateKey = `${this.STATE_PREFIX}:${operationId}`;
-      pipeline.setex(stateKey, this.DEFAULT_TTL, JSON.stringify(stepResult.newState));
+      pipeline.setex(
+        stateKey,
+        this.DEFAULT_TTL,
+        this.serializeStateForPersist(stepResult.newState),
+      );
 
       // Save step history
       const stepsKey = `${this.STEPS_PREFIX}:${operationId}`;
@@ -128,14 +266,10 @@ export class AgentStateManager {
       pipeline.ltrim(stepsKey, 0, 199); // Keep most recent 200 steps
       pipeline.expire(stepsKey, this.DEFAULT_TTL);
 
-      // Save step event sequence to agent_runtime_events
-      if (stepResult.events && stepResult.events.length > 0) {
-        const eventsKey = `${this.EVENTS_PREFIX}:${operationId}`;
-
-        pipeline.lpush(eventsKey, JSON.stringify(stepResult.events));
-        pipeline.ltrim(eventsKey, 0, 199); // Keep events from most recent 200 steps
-        pipeline.expire(eventsKey, this.DEFAULT_TTL);
-      }
+      // `stepResult.events` is intentionally NOT persisted: nothing ever read
+      // the `agent_runtime_events` list back — the same events already reach
+      // clients through the live stream and land durably in the operation
+      // trace, so the list only duplicated every streamed byte into Redis.
 
       // Update operation metadata
       const metaKey = `${this.METADATA_PREFIX}:${operationId}`;
@@ -150,12 +284,7 @@ export class AgentStateManager {
 
       await pipeline.exec();
 
-      log(
-        '[%s:%d] Saved step result with %d events',
-        operationId,
-        stepResult.stepIndex,
-        stepResult.events?.length || 0,
-      );
+      log('[%s:%d] Saved step result', operationId, stepResult.stepIndex);
     } catch (error) {
       console.error('Failed to save step result:', error);
       throw error;
@@ -191,13 +320,19 @@ export class AgentStateManager {
       }
 
       return {
+        acceptsMemberRuntimeEnd: metadata.acceptsMemberRuntimeEnd === 'true' || undefined,
         agentConfig: metadata.agentConfig ? JSON.parse(metadata.agentConfig) : undefined,
+        visitorRedaction: metadata.visitorRedaction
+          ? JSON.parse(metadata.visitorRedaction)
+          : undefined,
         createdAt: metadata.createdAt,
         lastActiveAt: metadata.lastActiveAt,
         modelRuntimeConfig: metadata.modelRuntimeConfig
           ? JSON.parse(metadata.modelRuntimeConfig)
           : undefined,
+        mirrorToOperationId: metadata.mirrorToOperationId || undefined,
         status: metadata.status as AgentState['status'],
+        streamOwnerUserId: metadata.streamOwnerUserId || undefined,
         totalCost: parseFloat(metadata.totalCost) || 0,
         totalSteps: parseInt(metadata.totalSteps) || 0,
         userId: metadata.userId,
@@ -215,8 +350,12 @@ export class AgentStateManager {
   async createOperationMetadata(
     operationId: string,
     data: {
+      acceptsMemberRuntimeEnd?: boolean;
       agentConfig?: any;
+      visitorRedaction?: { showErrorDetails?: boolean; showModelInfo?: boolean };
+      mirrorToOperationId?: string;
       modelRuntimeConfig?: any;
+      streamOwnerUserId?: string;
       userId?: string;
       workspaceId?: string;
     },
@@ -225,11 +364,15 @@ export class AgentStateManager {
 
     try {
       const metadata: AgentOperationMetadata = {
+        acceptsMemberRuntimeEnd: data.acceptsMemberRuntimeEnd,
         agentConfig: data.agentConfig,
+        visitorRedaction: data.visitorRedaction,
         createdAt: new Date().toISOString(),
         lastActiveAt: new Date().toISOString(),
+        mirrorToOperationId: data.mirrorToOperationId,
         modelRuntimeConfig: data.modelRuntimeConfig,
         status: 'idle',
+        streamOwnerUserId: data.streamOwnerUserId,
         totalCost: 0,
         totalSteps: 0,
         userId: data.userId,
@@ -246,10 +389,16 @@ export class AgentStateManager {
       };
 
       if (metadata.userId) redisData.userId = metadata.userId;
+      if (metadata.streamOwnerUserId) redisData.streamOwnerUserId = metadata.streamOwnerUserId;
       if (metadata.workspaceId) redisData.workspaceId = metadata.workspaceId;
+      if (metadata.mirrorToOperationId)
+        redisData.mirrorToOperationId = metadata.mirrorToOperationId;
+      if (metadata.acceptsMemberRuntimeEnd) redisData.acceptsMemberRuntimeEnd = 'true';
       if (metadata.modelRuntimeConfig)
         redisData.modelRuntimeConfig = JSON.stringify(metadata.modelRuntimeConfig);
       if (metadata.agentConfig) redisData.agentConfig = JSON.stringify(metadata.agentConfig);
+      if (metadata.visitorRedaction)
+        redisData.visitorRedaction = JSON.stringify(metadata.visitorRedaction);
 
       await this.redis.hmset(metaKey, redisData);
       await this.redis.expire(metaKey, this.DEFAULT_TTL);
@@ -300,7 +449,9 @@ export class AgentStateManager {
       `${this.STATE_PREFIX}:${operationId}`,
       `${this.STEPS_PREFIX}:${operationId}`,
       `${this.METADATA_PREFIX}:${operationId}`,
-      `${this.EVENTS_PREFIX}:${operationId}`,
+      `${this.INTERRUPT_PREFIX}:${operationId}`,
+      `${this.QUEUED_MESSAGES_PREFIX}:${operationId}`,
+      `${this.INLINE_RESUME_PREFIX}:${operationId}`,
     ];
 
     try {
@@ -411,25 +562,80 @@ export class AgentStateManager {
     }
   }
 
-  private stepLockKey(operationId: string, stepIndex: number): string {
-    return `agent_runtime_step_lock:${operationId}:${stepIndex}`;
+  /**
+   * The inline step loop's envelope for the step it is about to run. This is the
+   * queue message that would otherwise be in flight — parked here instead, so a
+   * redelivery arriving after the loop died can pick the operation back up from
+   * where it actually stopped rather than from the delivered (older) step index.
+   */
+  async saveInlineResume(operationId: string, serialized: string): Promise<boolean> {
+    try {
+      await this.redis.setex(
+        `${this.INLINE_RESUME_PREFIX}:${operationId}`,
+        this.DEFAULT_TTL,
+        serialized,
+      );
+      return true;
+    } catch (error) {
+      // Reported, never swallowed: the caller must fall back to the queue, or
+      // it would run the next step with no recovery path behind it at all.
+      console.error('Failed to save inline resume pointer:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Deliberately not wrapped in a try/catch. "No envelope" and "could not read
+   * the envelope" have opposite consequences: the first means run the delivered
+   * step, the second means an operation may be mid-loop with nothing queued
+   * behind it. Swallowing the error would ACK that delivery as stale and strand
+   * the run, so the failure propagates and the queue retries instead.
+   */
+  async loadInlineResume(operationId: string): Promise<null | string> {
+    return this.redis.get(`${this.INLINE_RESUME_PREFIX}:${operationId}`);
+  }
+
+  /**
+   * Owner-scoped, and best-effort on failure: a stale envelope is harmless. It
+   * only ever resumes a step whose index is ahead of the delivered one, and the
+   * next step to park overwrites it — worst case it expires with the
+   * operation's TTL. Deleting someone else's envelope is not harmless, hence
+   * the ownership check.
+   */
+  async clearInlineResume(operationId: string, ownerId: string): Promise<void> {
+    try {
+      await this.redis.eval(
+        CLEAR_OWNED_INLINE_RESUME_SCRIPT,
+        2,
+        this.executionLockKey(operationId),
+        `${this.INLINE_RESUME_PREFIX}:${operationId}`,
+        ownerId,
+      );
+    } catch (error) {
+      console.error('Failed to clear inline resume pointer:', error);
+    }
+  }
+
+  private executionLockKey(operationId: string): string {
+    return `agent_runtime_operation_lock:${operationId}`;
   }
 
   async tryClaimStep(
     operationId: string,
-    stepIndex: number,
+    _stepIndex: number,
     ttlSeconds: number = 35,
+    ownerId: string = Date.now().toString(),
   ): Promise<boolean> {
     try {
-      const result = await this.redis.set(
-        this.stepLockKey(operationId, stepIndex),
-        Date.now().toString(),
-        'EX',
-        ttlSeconds,
-        'NX',
+      const result = await this.redis.eval(
+        CLAIM_OR_REENTER_LOCK_SCRIPT,
+        1,
+        this.executionLockKey(operationId),
+        ownerId,
+        ttlSeconds.toString(),
       );
 
-      return result === 'OK';
+      return result === 1;
     } catch (error) {
       // Fail-open: on Redis error, allow execution to proceed
       console.error('Failed to acquire step lock:', error);
@@ -437,9 +643,42 @@ export class AgentStateManager {
     }
   }
 
-  async releaseStepLock(operationId: string, stepIndex: number): Promise<void> {
+  async refreshStepLock(
+    operationId: string,
+    _stepIndex: number,
+    ttlSeconds: number,
+    ownerId?: string,
+  ): Promise<boolean> {
     try {
-      await this.redis.del(this.stepLockKey(operationId, stepIndex));
+      const key = this.executionLockKey(operationId);
+      if (!ownerId) {
+        return (await this.redis.expire(key, ttlSeconds)) === 1;
+      }
+
+      const result = await this.redis.eval(
+        REFRESH_OWNED_LOCK_SCRIPT,
+        1,
+        key,
+        ownerId,
+        ttlSeconds.toString(),
+      );
+
+      return result === 1;
+    } catch (error) {
+      console.error('Failed to refresh step lock:', error);
+      return false;
+    }
+  }
+
+  async releaseStepLock(operationId: string, _stepIndex: number, ownerId?: string): Promise<void> {
+    try {
+      const key = this.executionLockKey(operationId);
+      if (!ownerId) {
+        await this.redis.del(key);
+        return;
+      }
+
+      await this.redis.eval(RELEASE_OWNED_LOCK_SCRIPT, 1, key, ownerId);
     } catch (error) {
       console.error('Failed to release step lock:', error);
     }

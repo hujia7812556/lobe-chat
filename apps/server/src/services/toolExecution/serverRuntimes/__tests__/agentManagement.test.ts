@@ -2,30 +2,79 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { AgentModel } from '@/database/models/agent';
 import { PluginModel } from '@/database/models/plugin';
+import { DiscoverService } from '@/server/services/discover';
 
 import { agentManagementRuntime } from '../agentManagement';
 
-const { mockCountAgents, mockGetAssistantList, mockQueryAgents } = vi.hoisted(() => ({
+const {
+  mockCountAgents,
+  mockGetAssistantList,
+  mockQueryAgents,
+  mockGetAgentConfigById,
+  mockServiceUpdateConfig,
+  mockUpdateConfig,
+  mockFindById,
+  mockCreatePlugin,
+  mockGetMcpManifest,
+  mockQueryPlugins,
+  mockResolveConnectors,
+  mockUpdatePlugin,
+} = vi.hoisted(() => ({
   mockCountAgents: vi.fn(),
+  mockCreatePlugin: vi.fn(),
+  mockFindById: vi.fn(),
+  mockGetMcpManifest: vi.fn(),
+  mockQueryPlugins: vi.fn(),
+  mockResolveConnectors: vi.fn(),
+  mockUpdatePlugin: vi.fn(),
+  mockGetAgentConfigById: vi.fn(),
   mockGetAssistantList: vi.fn(),
   mockQueryAgents: vi.fn(),
+  mockServiceUpdateConfig: vi.fn(),
+  mockUpdateConfig: vi.fn(),
+}));
+
+vi.mock('@/server/services/agent', () => ({
+  AgentService: vi.fn(function () {
+    return { updateAgentConfig: mockServiceUpdateConfig };
+  }),
 }));
 
 vi.mock('@/database/models/agent', () => ({
-  AgentModel: vi.fn(() => ({
-    countAgents: mockCountAgents,
-    queryAgents: mockQueryAgents,
-  })),
+  AgentModel: vi.fn(function () {
+    return {
+      countAgents: mockCountAgents,
+      getAgentConfigById: mockGetAgentConfigById,
+      queryAgents: mockQueryAgents,
+      updateConfig: mockUpdateConfig,
+    };
+  }),
 }));
 
 vi.mock('@/database/models/plugin', () => ({
-  PluginModel: vi.fn(() => ({})),
+  PluginModel: vi.fn(function () {
+    return {
+      create: mockCreatePlugin,
+      findById: mockFindById,
+      query: mockQueryPlugins,
+      update: mockUpdatePlugin,
+    };
+  }),
+}));
+
+vi.mock('@/database/models/connector', () => ({
+  ConnectorModel: vi.fn(function () {
+    return { resolveAll: mockResolveConnectors };
+  }),
 }));
 
 vi.mock('@/server/services/discover', () => ({
-  DiscoverService: vi.fn(() => ({
-    getAssistantList: mockGetAssistantList,
-  })),
+  DiscoverService: vi.fn(function () {
+    return {
+      getAssistantList: mockGetAssistantList,
+      getMcpManifest: mockGetMcpManifest,
+    };
+  }),
 }));
 
 const createRuntime = () =>
@@ -55,6 +104,22 @@ const makeAgents = (count: number, startIndex = 0) =>
 describe('agentManagementRuntime', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockServiceUpdateConfig.mockImplementation((...args) => mockUpdateConfig(...args));
+    mockResolveConnectors.mockResolvedValue([]);
+    mockQueryPlugins.mockResolvedValue([]);
+    mockGetMcpManifest.mockRejectedValue(new Error('not in marketplace'));
+  });
+
+  it('does not persist a model change rejected by the shared-agent policy', async () => {
+    mockGetAgentConfigById.mockResolvedValue({ id: 'agent-1', provider: 'lobehub' });
+    mockServiceUpdateConfig.mockRejectedValueOnce(new Error('Shared agent provider is restricted'));
+    const result = await createRuntime().updateAgent({
+      agentId: 'agent-1',
+      config: { model: 'gpt-4o', provider: 'openai' },
+    });
+    expect(result.success).toBe(false);
+    expect(result.content).toContain('Shared agent provider is restricted');
+    expect(mockUpdateConfig).not.toHaveBeenCalled();
   });
 
   it('declares the agent management runtime identifier', () => {
@@ -82,7 +147,6 @@ describe('agentManagementRuntime', () => {
         {
           agentId: 'agent-target',
           instruction: 'Do delegated work',
-          runAsTask: true,
         },
         { toolManifestMap: {} },
       );
@@ -103,9 +167,6 @@ describe('agentManagementRuntime', () => {
         {
           agentId: 'agent-target',
           instruction: 'Do delegated work',
-          runAsTask: true,
-          taskTitle: 'Delegated task',
-          timeout: 1234,
         },
         {
           subAgent: { run },
@@ -115,9 +176,9 @@ describe('agentManagementRuntime', () => {
 
       expect(run).toHaveBeenCalledWith({
         agentId: 'agent-target',
-        description: 'Delegated task',
+        description: 'Call agent agent-target',
         instruction: 'Do delegated work',
-        timeout: 1234,
+        timeout: 1_800_000,
       });
       expect(result).toMatchObject({
         content: '',
@@ -143,7 +204,6 @@ describe('agentManagementRuntime', () => {
         {
           agentId: 'agent-target',
           instruction: 'Do delegated work',
-          runAsTask: true,
         },
         {
           subAgent: { run },
@@ -156,6 +216,29 @@ describe('agentManagementRuntime', () => {
         code: 'AGENT_CALL_START_FAILED',
       });
       expect(result.deferred).toBeUndefined();
+    });
+
+    it('surfaces the underlying start error so the failure is diagnosable', async () => {
+      const run = vi.fn().mockResolvedValue({
+        error: 'Agent not found: agent-target',
+        started: false,
+        threadId: '',
+      });
+      const runtime = createRuntime();
+
+      const result = await runtime.callAgent(
+        { agentId: 'agent-target', instruction: 'Do delegated work' },
+        { subAgent: { run }, toolManifestMap: {} },
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.content).toBe(
+        'Agent "agent-target" failed to start: Agent not found: agent-target',
+      );
+      expect(result.error).toMatchObject({
+        code: 'AGENT_CALL_START_FAILED',
+        message: 'Agent "agent-target" failed to start: Agent not found: agent-target',
+      });
     });
 
     it('rejects nested server callAgent execution', async () => {
@@ -217,7 +300,7 @@ describe('agentManagementRuntime', () => {
 
       expect(mockQueryAgents).toHaveBeenCalledWith({ keyword: undefined, limit: 20, offset: 0 });
       expect(result.content).toContain(
-        'requested limit 50 exceeds the maximum of 20, so results were capped at 20',
+        'Requested limit 50 exceeds the maximum of 20; results were capped at 20 per call.',
       );
       expect(result.state).toMatchObject({ hasMore: false });
     });
@@ -230,7 +313,7 @@ describe('agentManagementRuntime', () => {
       const result = await runtime.searchAgent({ keyword: 'nonexistent', source: 'user' });
 
       expect(result.success).toBe(true);
-      expect(result.content).toContain('No agents found matching your search criteria.');
+      expect(result.content).toContain('No agents matched');
     });
 
     it('explains an out-of-range offset instead of claiming no matches', async () => {
@@ -241,7 +324,31 @@ describe('agentManagementRuntime', () => {
       const result = await runtime.searchAgent({ offset: 200, source: 'user' });
 
       expect(result.success).toBe(true);
-      expect(result.content).toContain('No agents at offset 200; only 37 agents match');
+      expect(result.content).toContain('No agents at offset 200; only 37 match');
+    });
+
+    it('surfaces heteroType for heterogeneous workspace agents', async () => {
+      mockQueryAgents.mockResolvedValue([
+        {
+          avatar: null,
+          backgroundColor: null,
+          description: null,
+          heteroType: 'claude-code',
+          id: 'agent-cc',
+          title: 'CC 2号机',
+        },
+      ]);
+      mockCountAgents.mockResolvedValue(1);
+
+      const runtime = createRuntime();
+      const result = await runtime.searchAgent({ source: 'user' });
+
+      expect(result.success).toBe(true);
+      expect(result.content).toContain('heteroType="claude-code"');
+      expect(result.content).toContain('heterogeneous agents');
+      expect(result.state).toMatchObject({
+        agents: [expect.objectContaining({ id: 'agent-cc', heteroType: 'claude-code' })],
+      });
     });
 
     it('searches the marketplace without counting workspace agents', async () => {
@@ -305,6 +412,156 @@ describe('agentManagementRuntime', () => {
 
       expect(result.success).toBe(false);
       expect(result.content).toContain('Failed to search agents');
+    });
+  });
+
+  describe('installPlugin', () => {
+    it('installs a marketplace plugin with its manifest and pins it', async () => {
+      const manifest = { api: [{ name: 'run' }], identifier: 'plugin-b' };
+      mockGetAgentConfigById.mockResolvedValue({ id: 'agent-1', plugins: ['plugin-a'] });
+      mockFindById.mockResolvedValue(undefined);
+      mockGetMcpManifest.mockResolvedValue(manifest);
+
+      const runtime = createRuntime();
+      const result = await runtime.installPlugin({
+        agentId: 'agent-1',
+        identifier: 'plugin-b',
+        source: 'market',
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.content).toContain('next run');
+      expect(mockCreatePlugin).toHaveBeenCalledWith({
+        identifier: 'plugin-b',
+        manifest,
+        type: 'plugin',
+      });
+      expect(mockUpdateConfig).toHaveBeenCalledWith('agent-1', {
+        plugins: ['plugin-a', { identifier: 'plugin-b', mode: 'pinned' }],
+      });
+    });
+
+    // Vent msg_f46kelJyavbcB2Xkz9: `adkit` was a custom MCP behind OAuth whose
+    // manifest never listed tools; installPlugin reported success while every
+    // activateTools call returned "Not found".
+    it('refuses an installed plugin whose manifest lists no tools', async () => {
+      mockGetAgentConfigById.mockResolvedValue({ id: 'agent-1', plugins: [] });
+      mockFindById.mockResolvedValue({
+        identifier: 'adkit',
+        manifest: { identifier: 'adkit', type: 'mcp', url: 'https://mcp.adkit.so' },
+        type: 'customPlugin',
+      });
+
+      const result = await createRuntime().installPlugin({
+        agentId: 'agent-1',
+        identifier: 'adkit',
+        source: 'market',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.error).toMatchObject({ type: 'PluginHasNoTools' });
+      expect(result.content).toContain('Connectors');
+      expect(mockUpdateConfig).not.toHaveBeenCalled();
+    });
+
+    it('writes no bare row for an id the marketplace does not know', async () => {
+      mockGetAgentConfigById.mockResolvedValue({ id: 'agent-1', plugins: [] });
+      mockFindById.mockResolvedValue(undefined);
+
+      const result = await createRuntime().installPlugin({
+        agentId: 'agent-1',
+        identifier: 'adkit-ads-mcp',
+        source: 'market',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.error).toMatchObject({ type: 'PluginNotFound' });
+      expect(mockCreatePlugin).not.toHaveBeenCalled();
+      expect(mockUpdateConfig).not.toHaveBeenCalled();
+    });
+
+    it('refuses an official integration that is not connected', async () => {
+      mockGetAgentConfigById.mockResolvedValue({ id: 'agent-1', plugins: [] });
+      mockFindById.mockResolvedValue(undefined);
+
+      const result = await createRuntime().installPlugin({
+        agentId: 'agent-1',
+        identifier: 'gmail',
+        source: 'official',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.error).toMatchObject({ type: 'PluginNotConnected' });
+      expect(mockUpdateConfig).not.toHaveBeenCalled();
+    });
+
+    it('pins a builtin tool without registering a plugin row', async () => {
+      mockGetAgentConfigById.mockResolvedValue({ id: 'agent-1', plugins: [] });
+
+      const result = await createRuntime().installPlugin({
+        agentId: 'agent-1',
+        identifier: 'lobe-web-browsing',
+        source: 'official',
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.content).not.toContain('next run');
+      expect(mockCreatePlugin).not.toHaveBeenCalled();
+      expect(mockUpdateConfig).toHaveBeenCalledWith('agent-1', {
+        plugins: [{ identifier: 'lobe-web-browsing', mode: 'pinned' }],
+      });
+    });
+
+    it('flips an existing disabled object entry back to pinned in place, without duplicating it', async () => {
+      mockGetAgentConfigById.mockResolvedValue({
+        id: 'agent-1',
+        plugins: ['plugin-a', { identifier: 'plugin-b', mode: 'disabled' }],
+      });
+      mockFindById.mockResolvedValue({ identifier: 'plugin-b', manifest: { api: [] } });
+
+      const runtime = createRuntime();
+      const result = await runtime.installPlugin({ agentId: 'agent-1', identifier: 'plugin-b' });
+
+      expect(result.success).toBe(true);
+      expect(mockUpdateConfig).toHaveBeenCalledWith('agent-1', {
+        plugins: ['plugin-a', { identifier: 'plugin-b', mode: 'pinned' }],
+      });
+    });
+
+    it('is a no-op write when the identifier is already pinned', async () => {
+      mockGetAgentConfigById.mockResolvedValue({
+        id: 'agent-1',
+        plugins: ['plugin-a', 'plugin-b'],
+      });
+      mockFindById.mockResolvedValue({ identifier: 'plugin-b', manifest: { api: [] } });
+
+      const runtime = createRuntime();
+      const result = await runtime.installPlugin({ agentId: 'agent-1', identifier: 'plugin-b' });
+
+      expect(result.success).toBe(true);
+      expect(mockUpdateConfig).not.toHaveBeenCalled();
+    });
+  });
+
+  // Regression guard: built without an identity, DiscoverService sends no
+  // credentials at all, so every market read from this runtime failed as
+  // `unauthorized` while the client-side path — which signs a trusted-client
+  // token — kept working.
+  describe('market identity', () => {
+    it('passes the run identity to DiscoverService', () => {
+      createRuntime();
+
+      expect(DiscoverService).toHaveBeenCalledWith({
+        userInfo: { userId: 'user-1', workspaceId: undefined },
+      });
+    });
+
+    it('scopes the market identity to the run workspace', () => {
+      createWorkspaceRuntime();
+
+      expect(DiscoverService).toHaveBeenCalledWith({
+        userInfo: { userId: 'user-1', workspaceId: 'workspace-1' },
+      });
     });
   });
 });

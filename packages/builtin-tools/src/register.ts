@@ -22,7 +22,14 @@ import {
   AgentManagementRenders,
   AgentManagementStreamings,
 } from '@lobechat/builtin-tool-agent-management/client';
+import { AuvIdentifier, AuvInspectors } from '@lobechat/builtin-tool-auv/client';
 import {
+  BrowserInspectors,
+  BrowserManifest,
+  BrowserRenders,
+} from '@lobechat/builtin-tool-browser/client';
+import {
+  ClaudeCodeApiName,
   ClaudeCodeIdentifier,
   ClaudeCodeInspectors,
   ClaudeCodeInterventions,
@@ -37,6 +44,14 @@ import {
   CloudSandboxStreamings,
 } from '@lobechat/builtin-tool-cloud-sandbox/client';
 import {
+  GoalInspectors,
+  GoalInterventions,
+  GoalManifest,
+  GoalRenders,
+  GoalSupervisorInspectors,
+  GoalSupervisorManifest,
+} from '@lobechat/builtin-tool-goal/client';
+import {
   GroupAgentBuilderInspectors,
   GroupAgentBuilderManifest,
   GroupAgentBuilderRenders,
@@ -50,6 +65,12 @@ import {
   GroupManagementStreamings,
 } from '@lobechat/builtin-tool-group-management/client';
 import {
+  ImageGenerationInspectors,
+  ImageGenerationManifest,
+  ImageGenerationRenders,
+  ImageGenerationStreamings,
+} from '@lobechat/builtin-tool-image-generation/client';
+import {
   KnowledgeBaseInspectors,
   KnowledgeBaseManifest,
   KnowledgeBaseRenders,
@@ -61,14 +82,6 @@ import {
   LobeAgentRenders,
   LobeAgentStreamings,
 } from '@lobechat/builtin-tool-lobe-agent/client';
-import {
-  LobeDeliveryCheckerInspectors,
-  LobeDeliveryCheckerManifest,
-  LobeDeliveryCheckerPortal,
-  LobeDeliveryCheckerPortalActions,
-  LobeDeliveryCheckerPortalTitle,
-  LobeDeliveryCheckerRenders,
-} from '@lobechat/builtin-tool-lobe-delivery-checker/client';
 import {
   LocalSystemApiName,
   LocalSystemIdentifier,
@@ -101,6 +114,7 @@ import {
   PageAgentStreamings,
 } from '@lobechat/builtin-tool-page-agent/client';
 import {
+  RemoteDeviceInspectors,
   RemoteDeviceManifest,
   RemoteDeviceRenders,
 } from '@lobechat/builtin-tool-remote-device/client';
@@ -118,11 +132,24 @@ import {
   SkillsManifest,
   SkillsRenders,
 } from '@lobechat/builtin-tool-skills/client';
-import { TaskInspectors, TaskManifest, TaskRenders } from '@lobechat/builtin-tool-task/client';
+import {
+  TaskInspectors,
+  TaskInterventions,
+  TaskManifest,
+  TaskRenders,
+} from '@lobechat/builtin-tool-task/client';
 import {
   UserInteractionIdentifier,
+  UserInteractionInspectors,
   UserInteractionInterventions,
+  UserInteractionRenders,
 } from '@lobechat/builtin-tool-user-interaction/client';
+import {
+  VideoGenerationInspectors,
+  VideoGenerationManifest,
+  VideoGenerationPlaceholders,
+  VideoGenerationRenders,
+} from '@lobechat/builtin-tool-video-generation/client';
 import {
   WebBrowsingInspectors,
   WebBrowsingManifest,
@@ -137,6 +164,11 @@ import {
   WebOnboardingManifest,
   WebOnboardingRenders,
 } from '@lobechat/builtin-tool-web-onboarding/client';
+import {
+  createReadLocalFileInspector,
+  createRunCommandInspector,
+  createWriteLocalFileInspector,
+} from '@lobechat/shared-tool-ui/inspectors';
 import { RunCommandRender } from '@lobechat/shared-tool-ui/renders';
 import type {
   BuiltinInspector,
@@ -152,13 +184,44 @@ import { CodexInspectors, CodexRenders } from './codex';
 import { GithubIdentifier, GithubInspectors, GithubRenders } from './github';
 import { registerBuiltinInspectors } from './inspectors';
 import { registerBuiltinInterventions } from './interventions';
-import { LinearIdentifier, LinearInspectors } from './linear';
+import { KimiCodeInspectors, KimiCodeRenders } from './kimiCode';
+import { LinearIdentifier, LinearInspectors, LinearRenders } from './linear';
 import { NotebookIdentifier, NotebookRenders } from './notebook';
 import { registerBuiltinPlaceholders } from './placeholders';
 import { registerBuiltinPortals } from './portals';
 import { registerBuiltinRenders } from './renders';
 import { registerBuiltinStreamings } from './streamings';
 import { TwitterIdentifier, TwitterInspectors } from './twitter';
+
+const DROID_IDENTIFIER = 'droid';
+const DEVIN_IDENTIFIER = 'devin';
+const QODER_IDENTIFIER = 'qoder';
+const OPENCODE_IDENTIFIER = 'opencode';
+const PI_IDENTIFIER = 'pi';
+const KIMI_CODE_IDENTIFIER = 'kimi-code';
+
+const heterogeneousCliInspectors: Record<string, BuiltinInspector> = {
+  bash: createRunCommandInspector(
+    'builtins.lobe-local-system.apiName.runCommand',
+  ) as BuiltinInspector,
+  read: createReadLocalFileInspector(
+    'builtins.lobe-local-system.apiName.readFile',
+  ) as BuiltinInspector,
+  write: createWriteLocalFileInspector(
+    'builtins.lobe-local-system.apiName.writeFile',
+  ) as BuiltinInspector,
+};
+
+const heterogeneousCliRenders: Record<string, BuiltinRender> = {
+  bash: RunCommandRender as BuiltinRender,
+  read: LocalSystemRenders[LocalSystemApiName.readFile] as BuiltinRender,
+  write: LocalSystemRenders[LocalSystemApiName.writeFile] as BuiltinRender,
+};
+
+const heterogeneousCliStreamings: Record<string, BuiltinStreaming> = {
+  bash: LocalSystemStreamings[LocalSystemApiName.runCommand] as BuiltinStreaming,
+  write: LocalSystemStreamings[LocalSystemApiName.writeFile] as BuiltinStreaming,
+};
 
 let builtinToolSurfacesRegistered = false;
 
@@ -170,18 +233,25 @@ export const registerBuiltinToolSurfaces = (): void => {
     [AgentDocumentsManifest.identifier]: AgentDocumentsRenders as Record<string, BuiltinRender>,
     [AgentManagementManifest.identifier]: AgentManagementRenders as Record<string, BuiltinRender>,
     [ClaudeCodeIdentifier]: ClaudeCodeRenders as Record<string, BuiltinRender>,
+    [DROID_IDENTIFIER]: {
+      [ClaudeCodeApiName.AskUserQuestion]: ClaudeCodeRenders[ClaudeCodeApiName.AskUserQuestion],
+    },
+    [DEVIN_IDENTIFIER]: {
+      [ClaudeCodeApiName.AskUserQuestion]: ClaudeCodeRenders[ClaudeCodeApiName.AskUserQuestion],
+    },
+    [QODER_IDENTIFIER]: ClaudeCodeRenders as Record<string, BuiltinRender>,
     [CloudSandboxManifest.identifier]: CloudSandboxRenders as Record<string, BuiltinRender>,
     [GroupAgentBuilderManifest.identifier]: GroupAgentBuilderRenders as Record<
       string,
       BuiltinRender
     >,
     [GroupManagementManifest.identifier]: GroupManagementRenders as Record<string, BuiltinRender>,
+    [GoalManifest.identifier]: GoalRenders as Record<string, BuiltinRender>,
+    [ImageGenerationManifest.identifier]: ImageGenerationRenders as Record<string, BuiltinRender>,
+    [VideoGenerationManifest.identifier]: VideoGenerationRenders as Record<string, BuiltinRender>,
     [KnowledgeBaseManifest.identifier]: KnowledgeBaseRenders as Record<string, BuiltinRender>,
     [LobeAgentManifest.identifier]: LobeAgentRenders as Record<string, BuiltinRender>,
-    [LobeDeliveryCheckerManifest.identifier]: LobeDeliveryCheckerRenders as Record<
-      string,
-      BuiltinRender
-    >,
+    [BrowserManifest.identifier]: BrowserRenders as Record<string, BuiltinRender>,
     [LocalSystemManifest.identifier]: LocalSystemRenders as Record<string, BuiltinRender>,
     [MemoryManifest.identifier]: MemoryRenders as Record<string, BuiltinRender>,
     [MessageManifest.identifier]: MessageRenders as Record<string, BuiltinRender>,
@@ -191,17 +261,26 @@ export const registerBuiltinToolSurfaces = (): void => {
     [SkillStoreManifest.identifier]: SkillStoreRenders as Record<string, BuiltinRender>,
     [SkillsManifest.identifier]: SkillsRenders as Record<string, BuiltinRender>,
     [TaskManifest.identifier]: TaskRenders as Record<string, BuiltinRender>,
+    [UserInteractionIdentifier]: UserInteractionRenders as Record<string, BuiltinRender>,
     [LobeActivatorManifest.identifier]: LobeActivatorRenders as Record<string, BuiltinRender>,
     [WebBrowsingManifest.identifier]: WebBrowsingRenders as Record<string, BuiltinRender>,
     [WebOnboardingManifest.identifier]: WebOnboardingRenders as Record<string, BuiltinRender>,
+    [OPENCODE_IDENTIFIER]: heterogeneousCliRenders,
+    [PI_IDENTIFIER]: heterogeneousCliRenders,
+    [KIMI_CODE_IDENTIFIER]: KimiCodeRenders as Record<string, BuiltinRender>,
     codex: {
       ...CodexRenders,
       command_execution: RunCommandRender as BuiltinRender,
     },
     [GithubIdentifier]: GithubRenders,
+    [LinearIdentifier]: LinearRenders,
   });
 
   registerBuiltinInspectors({
+    [AuvIdentifier]: AuvInspectors as Record<string, BuiltinInspector>,
+    // Read-only alias for messages recorded by the original private desktop PR.
+    // New manifests and execution routes only advertise lobe-computer-use.
+    'lobe-auv': AuvInspectors as Record<string, BuiltinInspector>,
     [AgentBuilderManifest.identifier]: AgentBuilderInspectors as Record<string, BuiltinInspector>,
     [AgentDocumentsManifest.identifier]: AgentDocumentsInspectors as Record<
       string,
@@ -212,6 +291,13 @@ export const registerBuiltinToolSurfaces = (): void => {
       BuiltinInspector
     >,
     [ClaudeCodeIdentifier]: ClaudeCodeInspectors as Record<string, BuiltinInspector>,
+    [DROID_IDENTIFIER]: {
+      [ClaudeCodeApiName.AskUserQuestion]: ClaudeCodeInspectors[ClaudeCodeApiName.AskUserQuestion],
+    },
+    [DEVIN_IDENTIFIER]: {
+      [ClaudeCodeApiName.AskUserQuestion]: ClaudeCodeInspectors[ClaudeCodeApiName.AskUserQuestion],
+    },
+    [QODER_IDENTIFIER]: ClaudeCodeInspectors as Record<string, BuiltinInspector>,
     [CloudSandboxManifest.identifier]: CloudSandboxInspectors as Record<string, BuiltinInspector>,
     [GroupAgentBuilderManifest.identifier]: GroupAgentBuilderInspectors as Record<
       string,
@@ -221,16 +307,24 @@ export const registerBuiltinToolSurfaces = (): void => {
       string,
       BuiltinInspector
     >,
-    [KnowledgeBaseManifest.identifier]: KnowledgeBaseInspectors as Record<string, BuiltinInspector>,
-    [LobeAgentManifest.identifier]: LobeAgentInspectors as Record<string, BuiltinInspector>,
-    [LobeDeliveryCheckerManifest.identifier]: LobeDeliveryCheckerInspectors as Record<
+    [GoalManifest.identifier]: GoalInspectors as Record<string, BuiltinInspector>,
+    [GoalSupervisorManifest.identifier]: GoalSupervisorInspectors,
+    [ImageGenerationManifest.identifier]: ImageGenerationInspectors as Record<
       string,
       BuiltinInspector
     >,
+    [VideoGenerationManifest.identifier]: VideoGenerationInspectors as Record<
+      string,
+      BuiltinInspector
+    >,
+    [KnowledgeBaseManifest.identifier]: KnowledgeBaseInspectors as Record<string, BuiltinInspector>,
+    [LobeAgentManifest.identifier]: LobeAgentInspectors as Record<string, BuiltinInspector>,
+    [BrowserManifest.identifier]: BrowserInspectors as Record<string, BuiltinInspector>,
     [LocalSystemManifest.identifier]: LocalSystemInspectors as Record<string, BuiltinInspector>,
     [MemoryManifest.identifier]: MemoryInspectors as Record<string, BuiltinInspector>,
     [MessageManifest.identifier]: MessageInspectors as Record<string, BuiltinInspector>,
     [PageAgentManifest.identifier]: PageAgentInspectors as Record<string, BuiltinInspector>,
+    [RemoteDeviceManifest.identifier]: RemoteDeviceInspectors as Record<string, BuiltinInspector>,
     [LobeActivatorManifest.identifier]: LobeActivatorInspectors as Record<string, BuiltinInspector>,
     [selfFeedbackIntentManifest.identifier]: SelfFeedbackIntentInspectors as Record<
       string,
@@ -239,9 +333,13 @@ export const registerBuiltinToolSurfaces = (): void => {
     [SkillStoreManifest.identifier]: SkillStoreInspectors as Record<string, BuiltinInspector>,
     [SkillsManifest.identifier]: SkillsInspectors as Record<string, BuiltinInspector>,
     [TaskManifest.identifier]: TaskInspectors as Record<string, BuiltinInspector>,
+    [UserInteractionIdentifier]: UserInteractionInspectors as Record<string, BuiltinInspector>,
     [WebBrowsingManifest.identifier]: WebBrowsingInspectors as Record<string, BuiltinInspector>,
     [WebOnboardingManifest.identifier]: WebOnboardingInspectors as Record<string, BuiltinInspector>,
-    codex: CodexInspectors,
+    [OPENCODE_IDENTIFIER]: heterogeneousCliInspectors,
+    [PI_IDENTIFIER]: heterogeneousCliInspectors,
+    [KIMI_CODE_IDENTIFIER]: KimiCodeInspectors,
+    'codex': CodexInspectors,
     [GithubIdentifier]: GithubInspectors,
     [LinearIdentifier]: LinearInspectors,
     [TwitterIdentifier]: TwitterInspectors,
@@ -258,7 +356,9 @@ export const registerBuiltinToolSurfaces = (): void => {
       BuiltinStreaming
     >,
     [ClaudeCodeIdentifier]: ClaudeCodeStreamings as Record<string, BuiltinStreaming>,
+    [QODER_IDENTIFIER]: ClaudeCodeStreamings as Record<string, BuiltinStreaming>,
     [CloudSandboxManifest.identifier]: CloudSandboxStreamings as Record<string, BuiltinStreaming>,
+    [ImageGenerationManifest.identifier]: ImageGenerationStreamings,
     [GroupAgentBuilderManifest.identifier]: GroupAgentBuilderStreamings as Record<
       string,
       BuiltinStreaming
@@ -271,7 +371,9 @@ export const registerBuiltinToolSurfaces = (): void => {
     [LocalSystemManifest.identifier]: LocalSystemStreamings as Record<string, BuiltinStreaming>,
     [MemoryManifest.identifier]: MemoryStreamings as Record<string, BuiltinStreaming>,
     [MessageManifest.identifier]: MessageStreamings as Record<string, BuiltinStreaming>,
+    [OPENCODE_IDENTIFIER]: heterogeneousCliStreamings,
     [PageAgentManifest.identifier]: PageAgentStreamings as Record<string, BuiltinStreaming>,
+    [PI_IDENTIFIER]: heterogeneousCliStreamings,
   });
 
   registerBuiltinInterventions({
@@ -280,6 +382,15 @@ export const registerBuiltinToolSurfaces = (): void => {
       BuiltinIntervention
     >,
     [ClaudeCodeIdentifier]: ClaudeCodeInterventions as Record<string, BuiltinIntervention>,
+    [DROID_IDENTIFIER]: {
+      [ClaudeCodeApiName.AskUserQuestion]:
+        ClaudeCodeInterventions[ClaudeCodeApiName.AskUserQuestion],
+    },
+    [DEVIN_IDENTIFIER]: {
+      [ClaudeCodeApiName.AskUserQuestion]:
+        ClaudeCodeInterventions[ClaudeCodeApiName.AskUserQuestion],
+    },
+    [QODER_IDENTIFIER]: ClaudeCodeInterventions as Record<string, BuiltinIntervention>,
     [CloudSandboxManifest.identifier]: CloudSandboxInterventions as Record<
       string,
       BuiltinIntervention
@@ -288,10 +399,12 @@ export const registerBuiltinToolSurfaces = (): void => {
       string,
       BuiltinIntervention
     >,
+    [GoalManifest.identifier]: GoalInterventions as Record<string, BuiltinIntervention>,
     [LobeAgentManifest.identifier]: LobeAgentInterventions as Record<string, BuiltinIntervention>,
     [LocalSystemIdentifier]: LocalSystemInterventions as Record<string, BuiltinIntervention>,
     [MemoryManifest.identifier]: MemoryInterventions as Record<string, BuiltinIntervention>,
     [MessageManifest.identifier]: MessageInterventions as Record<string, BuiltinIntervention>,
+    [TaskManifest.identifier]: TaskInterventions as Record<string, BuiltinIntervention>,
     [UserInteractionIdentifier]: UserInteractionInterventions as Record<
       string,
       BuiltinIntervention
@@ -310,21 +423,18 @@ export const registerBuiltinToolSurfaces = (): void => {
       listLocalFiles: LocalSystemListFilesPlaceholder as BuiltinPlaceholder,
       searchLocalFiles: LocalSystemSearchFilesPlaceholder as BuiltinPlaceholder,
     },
+    [VideoGenerationManifest.identifier]: VideoGenerationPlaceholders as Record<
+      string,
+      BuiltinPlaceholder
+    >,
     [WebBrowsingManifest.identifier]: WebBrowsingPlaceholders as Record<string, BuiltinPlaceholder>,
   });
 
   registerBuiltinPortals({
-    actions: {
-      [LobeDeliveryCheckerManifest.identifier]:
-        LobeDeliveryCheckerPortalActions as BuiltinPortalTitle,
-    },
     portals: {
-      [LobeDeliveryCheckerManifest.identifier]: LobeDeliveryCheckerPortal as BuiltinPortal,
       [WebBrowsingManifest.identifier]: WebBrowsingPortal as BuiltinPortal,
     },
     titles: {
-      [LobeDeliveryCheckerManifest.identifier]:
-        LobeDeliveryCheckerPortalTitle as BuiltinPortalTitle,
       [WebBrowsingManifest.identifier]: WebBrowsingPortalTitle as BuiltinPortalTitle,
     },
   });

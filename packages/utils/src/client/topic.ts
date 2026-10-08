@@ -1,4 +1,11 @@
-import type { ChatTopic, ChatTopicStatus, GroupedTopic, TimeGroupId } from '@lobechat/types';
+import type {
+  ChatTopic,
+  ChatTopicMetadata,
+  ChatTopicStatus,
+  GroupedTopic,
+  TimeGroupId,
+} from '@lobechat/types';
+import { getWorkingDirEffectivePath, getWorkingDirSourcePath } from '@lobechat/types';
 import dayjs from 'dayjs';
 import isToday from 'dayjs/plugin/isToday';
 import isYesterday from 'dayjs/plugin/isYesterday';
@@ -64,6 +71,15 @@ const sortGroups = (groups: GroupedTopic[]): GroupedTopic[] => {
   });
 };
 
+/**
+ * Resolve the timestamp a topic sorts/groups by for the given field. For
+ * `updatedAt` this is the server-provided `sortUpdatedAt` (latest message
+ * activity), falling back to the raw `updatedAt` when absent — so the sidebar
+ * order matches the server ORDER BY and doesn't jump.
+ */
+export const getTopicSortTime = (topic: ChatTopic, field: 'createdAt' | 'updatedAt'): number =>
+  field === 'updatedAt' ? (topic.sortUpdatedAt ?? topic.updatedAt) : topic.createdAt;
+
 // Generic time-based grouping parameterized by field
 const groupTopicsByField = (
   topics: ChatTopic[],
@@ -71,11 +87,13 @@ const groupTopicsByField = (
 ): GroupedTopic[] => {
   if (!topics.length) return [];
 
-  const sortedTopics = [...topics].sort((a, b) => b[field] - a[field]);
+  const sortedTopics = [...topics].sort(
+    (a, b) => getTopicSortTime(b, field) - getTopicSortTime(a, field),
+  );
   const groupsMap = new Map<TimeGroupId, ChatTopic[]>();
 
   for (const topic of sortedTopics) {
-    const groupId = getTopicGroupId(topic[field]);
+    const groupId = getTopicGroupId(getTopicSortTime(topic, field));
     const existing = groupsMap.get(groupId);
     if (existing) {
       existing.push(topic);
@@ -100,44 +118,122 @@ export const groupTopicsByUpdatedTime = (topics: ChatTopic[]) =>
 const NO_PROJECT_GROUP_ID = 'no-project';
 const PROJECT_GROUP_PREFIX = 'project:';
 
-// Extract the final path segment as display name; supports POSIX and Windows separators
-const getProjectName = (dir: string): string => {
-  const segments = dir.split(/[/\\]+/).filter(Boolean);
-  return segments.at(-1) || dir;
+/**
+ * Normalizes project display names to their shortest distinguishing path suffix.
+ *
+ * Before:
+ * - "/Users/me/Git/lobehub/lobehub", "/Users/me/work/lobehub/lobehub"
+ *
+ * After:
+ * - "Git/lobehub/lobehub", "work/lobehub/lobehub"
+ */
+// Extract the final path segment as display name; supports POSIX and Windows separators.
+// Expand only colliding names so unrelated private ancestors stay out of the sidebar.
+const getProjectName = (
+  dir: string,
+  segments: string[],
+  suffixCounts: Map<string, number>,
+): string => {
+  // The first unique suffix reveals only as much of the path as needed.
+  for (let depth = 1; depth <= segments.length; depth++) {
+    const name = segments.slice(-depth).join('/');
+    if (suffixCounts.get(name) === 1) return name;
+  }
+
+  // Preserve absolute/relative and separator distinctions when all segments match.
+  return dir;
 };
 
-const normalizeWorkingDirectory = (dir: string): string => dir.replace(/[/\\]+$/, '').trim();
+const normalizeWorkingDirectory = (dir: string): string => dir.trim().replace(/[/\\]+$/, '');
 
+const normalizeOptionalWorkingDirectory = (dir: string | undefined): string | undefined => {
+  if (!dir) return undefined;
+  const normalized = normalizeWorkingDirectory(dir);
+  return normalized || undefined;
+};
+
+// Prefer the structured `workingDirectoryConfig`; fall back to the raw
+// `workingDirectory`. `workingDirectory` is typed as a string, but a malformed
+// topic may have persisted a `WorkingDirConfig` object into it (see #17050).
+// Routing the whole thing through the extractor (which accepts `string |
+// WorkingDirConfig`) yields the path for either shape instead of crashing
+// `normalizeWorkingDirectory` with `dir.trim is not a function`.
+export const getTopicMetadataWorkingDirectorySourcePath = (
+  metadata?: ChatTopicMetadata,
+): string | undefined =>
+  normalizeOptionalWorkingDirectory(
+    getWorkingDirSourcePath(metadata?.workingDirectoryConfig ?? metadata?.workingDirectory),
+  );
+
+export const getTopicMetadataWorkingDirectoryEffectivePath = (
+  metadata?: ChatTopicMetadata,
+): string | undefined =>
+  normalizeOptionalWorkingDirectory(
+    getWorkingDirEffectivePath(metadata?.workingDirectoryConfig ?? metadata?.workingDirectory),
+  );
+
+export const getTopicWorkingDirectorySourcePath = (topic: ChatTopic): string | undefined =>
+  getTopicMetadataWorkingDirectorySourcePath(topic.metadata);
+
+export const getTopicWorkingDirectoryEffectivePath = (topic: ChatTopic): string | undefined =>
+  getTopicMetadataWorkingDirectoryEffectivePath(topic.metadata);
+
+/**
+ * Groups topics by source directory with distinguishable project titles.
+ *
+ * Use when:
+ * - Rendering project groups in a topic sidebar or management view.
+ *
+ * Expects:
+ * - Topics with optional source or worktree directory metadata.
+ * - A timestamp field for descending activity order.
+ *
+ * Returns:
+ * - Stable path-based group IDs and sorted topics, with no-project topics last.
+ * - Basenames for unique projects and distinguishing path suffixes for collisions.
+ */
 export const groupTopicsByProject = (
   topics: ChatTopic[],
   field: 'createdAt' | 'updatedAt',
 ): GroupedTopic[] => {
   if (!topics.length) return [];
 
-  const groupsMap = new Map<string, { children: ChatTopic[]; path: string }>();
+  const groupsMap = new Map<string, { children: ChatTopic[]; path: string; segments: string[] }>();
 
   for (const topic of topics) {
-    const raw = topic.metadata?.workingDirectory;
-    const normalized = raw ? normalizeWorkingDirectory(raw) : '';
+    const normalized = getTopicWorkingDirectorySourcePath(topic) ?? '';
     const id = normalized ? `${PROJECT_GROUP_PREFIX}${normalized}` : NO_PROJECT_GROUP_ID;
     const existing = groupsMap.get(id);
     if (existing) {
       existing.children.push(topic);
     } else {
-      groupsMap.set(id, { children: [topic], path: normalized });
+      // Parse each source path once; display labels never change its grouping identity.
+      groupsMap.set(id, {
+        children: [topic],
+        path: normalized,
+        segments: normalized.split(/[/\\]+/).filter(Boolean),
+      });
     }
   }
 
   // Sort topics inside each group by chosen field desc
   for (const group of groupsMap.values()) {
-    group.children.sort((a, b) => b[field] - a[field]);
+    group.children.sort((a, b) => getTopicSortTime(b, field) - getTopicSortTime(a, field));
   }
 
+  // Count suffixes once so an expanding project list does not compare every pair of paths.
+  const suffixCounts = new Map<string, number>();
+  for (const { segments } of groupsMap.values()) {
+    for (let depth = 1; depth <= segments.length; depth++) {
+      const suffix = segments.slice(-depth).join('/');
+      suffixCounts.set(suffix, (suffixCounts.get(suffix) ?? 0) + 1);
+    }
+  }
   const groups: GroupedTopic[] = Array.from(groupsMap.entries()).map(
-    ([id, { children, path }]) => ({
+    ([id, { children, path, segments }]) => ({
       children,
       id,
-      title: id === NO_PROJECT_GROUP_ID ? undefined : getProjectName(path),
+      title: id === NO_PROJECT_GROUP_ID ? undefined : getProjectName(path, segments, suffixCounts),
     }),
   );
 
@@ -145,8 +241,8 @@ export const groupTopicsByProject = (
   return groups.sort((a, b) => {
     if (a.id === NO_PROJECT_GROUP_ID) return 1;
     if (b.id === NO_PROJECT_GROUP_ID) return -1;
-    const aTime = a.children[0]?.[field] ?? 0;
-    const bTime = b.children[0]?.[field] ?? 0;
+    const aTime = a.children[0] ? getTopicSortTime(a.children[0], field) : 0;
+    const bTime = b.children[0] ? getTopicSortTime(b.children[0], field) : 0;
     return bTime - aTime;
   });
 };
@@ -157,12 +253,7 @@ export const groupTopicsByProject = (
 // the sidebar surfaces "needs attention" in one place. The remaining buckets map
 // 1:1 to a status. The group `id` resolves its title via `groupTitle.byStatus.<id>`.
 export type TopicStatusBucket =
-  | 'pending'
-  | 'running'
-  | 'active'
-  | 'paused'
-  | 'completed'
-  | 'archived';
+  'pending' | 'running' | 'scheduled' | 'active' | 'completed' | 'archived';
 
 // Fixed priority order: `pending` (needs attention) comes first, then running,
 // then active; the remaining states fall below. Topics without a status are
@@ -177,8 +268,8 @@ export type TopicStatusBucket =
 export const STATUS_GROUP_ORDER: TopicStatusBucket[] = [
   'pending',
   'running',
+  'scheduled',
   'active',
-  'paused',
   'completed',
   'archived',
 ];
@@ -198,8 +289,12 @@ const resolveStatusBucket = (
   if (topic.status === 'waitingForHuman' || topic.status === 'failed' || topic.status === 'unread')
     return 'pending';
   if (loadingTopicIds?.has(topic.id) || topic.status === 'running') return 'running';
+  // `scheduled` (the backend will run this later — a user-deferred send, or an
+  // auto-continue after a rate limit) is its own bucket: it must NOT collapse
+  // into `pending`, so users don't read it as "needs manual action".
+  if (topic.status === 'scheduled') return 'scheduled';
   const status: ChatTopicStatus = topic.status ?? 'active';
-  if (status === 'paused' || status === 'completed' || status === 'archived') return status;
+  if (status === 'completed' || status === 'archived') return status;
   return 'active';
 };
 
@@ -224,7 +319,7 @@ export const groupTopicsByStatus = (
 
   // Sort topics inside each group by chosen field desc
   for (const children of groupsMap.values()) {
-    children.sort((a, b) => b[field] - a[field]);
+    children.sort((a, b) => getTopicSortTime(b, field) - getTopicSortTime(a, field));
   }
 
   // Emit only non-empty groups, in the fixed priority order

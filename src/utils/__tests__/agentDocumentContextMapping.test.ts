@@ -73,6 +73,11 @@ describe('toAgentContextDocument', () => {
     expect(toAgentContextDocument(buildDoc({ updatedAt: ts })).updatedAt).toBe(ts);
   });
 
+  it('propagates createdAt so the index can mark docs created during the current run', () => {
+    const ts = new Date('2026-09-23T22:57:58.000Z');
+    expect(toAgentContextDocument(buildDoc({ createdAt: ts })).createdAt).toBe(ts);
+  });
+
   it('maps a fully populated row into the AgentContextDocument shape', () => {
     const doc = buildDoc({
       description: 'web-crawled article',
@@ -91,6 +96,7 @@ describe('toAgentContextDocument', () => {
     expect(toAgentContextDocument(doc)).toEqual({
       content: 'body',
       contentCharCount: 4,
+      createdAt: doc.createdAt,
       description: 'web-crawled article',
       filename: 'crawl.md',
       id: 'agent-doc-2',
@@ -173,6 +179,29 @@ describe('toAgentContextDocuments', () => {
     const result = toAgentContextDocuments(rows);
 
     expect(result.map((d) => d.id)).toEqual(['doc']);
+  });
+
+  // Children inherit their `custom/folder` parent's title so the progressive
+  // folder row is still dropped — only its title survives, on the children.
+  it('stamps folderTitle on children of a custom/folder and drops the folder row', () => {
+    const rows = [
+      buildDoc({
+        documentId: 'folder-doc',
+        fileType: CUSTOM_FOLDER_FILE_TYPE,
+        id: 'folder-agentdoc',
+        isFolder: true,
+        title: 'dailyBrief',
+      }),
+      buildDoc({ id: 'child-1', parentId: 'folder-doc', sourceType: 'file' }),
+      buildDoc({ id: 'child-2', parentId: 'folder-doc', sourceType: 'file' }),
+      buildDoc({ id: 'root', parentId: null, sourceType: 'file' }),
+    ];
+
+    const result = toAgentContextDocuments(rows);
+
+    expect(result.map((d) => d.id)).toEqual(['child-1', 'child-2', 'root']);
+    expect(result.map((d) => d.folderTitle)).toEqual(['dailyBrief', 'dailyBrief', undefined]);
+    expect(result.map((d) => d.parentId)).toEqual(['folder-doc', 'folder-doc', undefined]);
   });
 
   it('keeps non-folder skill rows such as the SKILL.md index', () => {

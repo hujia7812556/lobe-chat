@@ -1,15 +1,12 @@
-import { FILE_URL } from '@lobechat/business-const';
 import { CUSTOM_DOCUMENT_FILE_TYPE } from '@lobechat/const';
 import { Notion } from '@lobehub/icons';
-import { Center, FileTypeIcon, Flexbox, Icon, Text } from '@lobehub/ui';
-import { Upload } from 'antd';
+import { Center, FileTypeIcon, Flexbox, Icon } from '@lobehub/ui';
+import { Text, Upload } from '@lobehub/ui/base-ui';
 import { createStaticStyles, cssVar } from 'antd-style';
 import { ArrowUpIcon, PlusIcon } from 'lucide-react';
 import React, { memo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
-import GuideModal from '@/components/GuideModal';
-import GuideVideo from '@/components/GuideVideo';
 import NavHeader from '@/features/NavHeader';
 import useNotionImport from '@/features/ResourceManager/components/Header/hooks/useNotionImport';
 import { usePermission } from '@/hooks/usePermission';
@@ -171,7 +168,7 @@ const PageExplorerPlaceholder = memo<PageExplorerPlaceholderProps>(
     };
 
     const handleUploadFile = async (file: File) => {
-      if (!canCreate) return false;
+      if (!canCreate) return;
 
       try {
         setIsUploading(true);
@@ -249,8 +246,6 @@ const PageExplorerPlaceholder = memo<PageExplorerPlaceholderProps>(
       } finally {
         setIsUploading(false);
       }
-
-      return false; // Prevent default upload behavior
     };
 
     return (
@@ -284,10 +279,9 @@ const PageExplorerPlaceholder = memo<PageExplorerPlaceholderProps>(
             {/* Upload Files (PDF, DOCX, Markdown) */}
             <Upload
               accept=".md,.markdown,.pdf,.docx"
-              beforeUpload={handleUploadFile}
               disabled={!canCreate || isUploading}
               multiple={false}
-              showUploadList={false}
+              onFiles={([file]) => handleUploadFile(file)}
             >
               <Flexbox
                 className={styles.card}
@@ -334,16 +328,6 @@ const PageExplorerPlaceholder = memo<PageExplorerPlaceholderProps>(
             </Flexbox>
           </Flexbox>
         </Center>
-        <GuideModal
-          cancelText={t('header.actions.notionGuide.cancel')}
-          cover={<GuideVideo height={269} src={FILE_URL.importFromNotionGuide} width={358} />}
-          desc={t('header.actions.notionGuide.desc')}
-          okText={t('header.actions.notionGuide.ok')}
-          open={notionImport.notionGuideOpen}
-          title={t('header.actions.notionGuide.title')}
-          onCancel={notionImport.handleCloseNotionGuide}
-          onOk={notionImport.handleStartNotionImport}
-        />
         <input
           accept=".zip"
           ref={notionImport.notionInputRef}

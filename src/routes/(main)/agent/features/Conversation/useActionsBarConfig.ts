@@ -7,32 +7,61 @@ import { useAgentStore } from '@/store/agent';
 import { agentSelectors } from '@/store/agent/selectors';
 
 /**
- * Hetero-agent sessions only support copy + delete — edit / regenerate /
- * branching / translate / tts / share don't apply because the external
- * runtime owns message lifecycle.
+ * Hetero-agent (Claude Code / Codex) sessions keep the menu minimal — copy +
+ * delete — because the external runtime owns the assistant message lifecycle
+ * (edit / branching / translate / share don't apply).
+ * Regenerate was previously excluded too; Codex now uses the existing
+ * heterogeneous rerun path, which preserves the user prompt and attachments.
+ * `select` remains available because forwarding / batch deletion is handled by
+ * the local conversation UI and does not depend on the external runtime.
+ *
+ * The one user-message action that DOES belong here is `restoreToInput`: a long
+ * CLI run that errors out or loses context is exactly when you want to pull the
+ * original prompt (text + attachments) back into the composer to retry. So it
+ * is scoped to the hetero user menu instead of the native-agent default.
  */
 const HETERO_USER: { bar: MessageActionSlot[]; menu: MessageActionSlot[] } = {
   bar: ['copy'],
-  menu: ['copy', 'divider', 'del'],
+  menu: ['restoreToInput', 'copy', 'divider', 'select', 'divider', 'del'],
 };
 
 const HETERO_ASSISTANT: { bar: MessageActionSlot[]; menu: MessageActionSlot[] } = {
   bar: ['copy'],
-  menu: ['copy', 'divider', 'del'],
+  menu: ['copy', 'divider', 'select', 'divider', 'del'],
 };
 
+/** Codex replies can reuse the existing heterogeneous regeneration path. */
+const CODEX_ASSISTANT: typeof HETERO_ASSISTANT = {
+  bar: ['copy', 'regenerate'],
+  menu: ['regenerate', ...HETERO_ASSISTANT.menu],
+};
+
+/**
+ * Selects message actions supported by the current agent runtime.
+ *
+ * Use when:
+ * - Configuring the main conversation's message action bars.
+ *
+ * Expects:
+ * - The active agent's configuration is available in the agent store.
+ *
+ * Returns:
+ * - Runtime-specific overrides, or native message defaults via an empty object.
+ */
 export const useActionsBarConfig = (): ActionsBarConfig => {
   const isHeteroAgent = useAgentStore(agentSelectors.isCurrentAgentHeterogeneous);
+
+  const providerType = useAgentStore(agentSelectors.currentAgentHeterogeneousProviderType);
 
   return useMemo<ActionsBarConfig>(() => {
     if (isHeteroAgent) {
       return {
-        assistant: HETERO_ASSISTANT,
-        assistantGroup: HETERO_ASSISTANT,
+        assistant: providerType === 'codex' ? CODEX_ASSISTANT : HETERO_ASSISTANT,
+        assistantGroup: providerType === 'codex' ? CODEX_ASSISTANT : HETERO_ASSISTANT,
         user: HETERO_USER,
       };
     }
 
     return {};
-  }, [isHeteroAgent]);
+  }, [isHeteroAgent, providerType]);
 };

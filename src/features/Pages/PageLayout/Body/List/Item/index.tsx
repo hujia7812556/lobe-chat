@@ -1,11 +1,14 @@
-import { Avatar, Icon } from '@lobehub/ui';
+import { Icon } from '@lobehub/ui';
+import { Avatar } from '@lobehub/ui/base-ui';
 import { FileTextIcon } from 'lucide-react';
 import { type MouseEvent } from 'react';
 import { memo, useCallback, useMemo, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 
+import { useActiveWorkspaceSlug } from '@/business/client/hooks/useActiveWorkspaceSlug';
 import { isDesktop } from '@/const/version';
 import NavItem from '@/features/NavPanel/components/NavItem';
+import { buildWorkspaceAwarePath } from '@/features/Workspace/workspaceAwarePath';
 import { useElectronStore } from '@/store/electron';
 import { pageSelectors, usePageStore } from '@/store/page';
 
@@ -28,6 +31,7 @@ const PageListItem = memo<DocumentItemProps>(({ pageId, className }) => {
   const selectPage = usePageStore((s) => s.selectPage);
   const setRenamingPageId = usePageStore((s) => s.setRenamingPageId);
   const addTab = useElectronStore((s) => s.addTab);
+  const activeWorkspaceSlug = useActiveWorkspaceSlug();
 
   const active = selectedPageId === pageId;
   const title = document?.title || t('pageList.untitled');
@@ -66,9 +70,9 @@ const PageListItem = memo<DocumentItemProps>(({ pageId, className }) => {
       clearTimeout(clickTimerRef.current);
       clickTimerRef.current = null;
     }
-    addTab(`/page/${pageId}`);
+    addTab(buildWorkspaceAwarePath(`/page/${pageId}`, activeWorkspaceSlug));
     selectPage(pageId);
-  }, [pageId, addTab, selectPage]);
+  }, [pageId, activeWorkspaceSlug, addTab, selectPage]);
 
   // Icon with emoji support
   const icon = useMemo(() => {

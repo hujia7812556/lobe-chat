@@ -1,11 +1,11 @@
 import { isDesktop } from '@lobechat/const';
 import type { UserGeneralConfig } from '@lobechat/types';
-import { getSingletonAnalyticsOptional } from '@lobehub/analytics';
 import { type SWRResponse } from 'swr';
 import useSWR from 'swr';
 import { type PartialDeep } from 'type-fest';
 
 import { DEFAULT_PREFERENCE } from '@/const/user';
+import { analyticsClient } from '@/libs/analytics/client';
 import { mutate, useOnlyFetchOnceSWR } from '@/libs/swr';
 import { taskTemplateKeys, userKeys } from '@/libs/swr/keys';
 import { userService } from '@/services/user';
@@ -17,6 +17,7 @@ import { type UserSettings } from '@/types/user/settings';
 import { merge } from '@/utils/merge';
 import { setNamespace } from '@/utils/storeDebug';
 
+import { writeUserDisplaySnapshot } from '../../displaySnapshot';
 import { userGeneralSettingsSelectors } from '../settings/selectors';
 
 const n = setNamespace('common');
@@ -107,6 +108,9 @@ export class CommonActionImpl {
       () => userService.getUserState(),
       {
         onError: (error) => {
+          // Record the init failure so gated tabs (Advanced / ServiceModel) can
+          // render error + Retry instead of a permanent skeleton.
+          this.#set({ isUserStateInitError: error }, false, n('initUserState/error'));
           options?.onError?.(error);
         },
         onSuccess: (data) => {
@@ -125,6 +129,11 @@ export class CommonActionImpl {
             // merge preference
             const isEmpty = Object.keys(data.preference || {}).length === 0;
             const preference = isEmpty ? DEFAULT_PREFERENCE : data.preference;
+
+            writeUserDisplaySnapshot(data.userId, {
+              avatar: data.avatar ?? '',
+              preference,
+            });
 
             // if there is avatar or userId (from client DB), update it into user
             const user =
@@ -149,8 +158,10 @@ export class CommonActionImpl {
                 isShowPWAGuide: data.canEnablePWAGuide,
                 isUserCanEnableTrace: data.canEnableTrace,
                 isUserHasConversation: data.hasConversation,
+                isIdentityResolved: true,
+                isSignedIn: Boolean(data.userId) || this.#get().isSignedIn,
                 isUserStateInit: true,
-                agentOnboarding: data.agentOnboarding,
+                isUserStateInitError: undefined,
                 onboarding: data.onboarding,
                 preference,
                 referralStatus: data.referralStatus,
@@ -172,11 +183,9 @@ export class CommonActionImpl {
             }
 
             // Keep reply language aligned with the browser locale until the user makes a choice.
-            // Only auto-fill once onboarding has finished — otherwise it pre-empts the language
-            // step in the shared-prefix onboarding (commonStepsCompleted derives from this field
-            // being set, and an auto-fill would skip past the user's explicit choice).
-            const hasFinishedOnboarding =
-              !!data.onboarding?.finishedAt || !!data.agentOnboarding?.finishedAt;
+            // Only auto-fill once onboarding has finished — otherwise it pre-empts the
+            // language step in the onboarding flow, skipping past the user's explicit choice.
+            const hasFinishedOnboarding = !!data.onboarding?.finishedAt;
             if (
               hasFinishedOnboarding &&
               !currentGeneralSettings?.responseLanguage &&
@@ -192,9 +201,7 @@ export class CommonActionImpl {
                 .catch(() => {});
             }
 
-            //analytics
-            const analytics = getSingletonAnalyticsOptional();
-            analytics?.identify(data.userId || '', {
+            analyticsClient.identify(data.userId || '', {
               email: data.email,
               firstName: data.firstName,
               lastName: data.lastName,

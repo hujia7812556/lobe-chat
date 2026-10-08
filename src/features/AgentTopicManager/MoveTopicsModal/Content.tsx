@@ -1,19 +1,17 @@
 'use client';
 
-import { DEFAULT_INBOX_AVATAR } from '@lobechat/const';
-import { Button, Flexbox, Icon, Text } from '@lobehub/ui';
-import { useModalContext } from '@lobehub/ui/base-ui';
+import { AGENT_CHAT_URL, DEFAULT_INBOX_AVATAR } from '@lobechat/const';
+import { agentDisplayName } from '@lobechat/types';
+import { Flexbox, Icon } from '@lobehub/ui';
+import { Button, Spin, Text, toast, useModalContext } from '@lobehub/ui/base-ui';
 import { createStaticStyles, cssVar } from 'antd-style';
 import { CircleCheck } from 'lucide-react';
 import { memo, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { useNavigate } from 'react-router';
 
-import { message } from '@/components/AntdStaticMethods';
-import NeuralNetworkLoading from '@/components/NeuralNetworkLoading';
-import { SESSION_CHAT_URL } from '@/const/url';
 import SkeletonList from '@/features/NavPanel/components/SkeletonList';
 import AgentItem from '@/features/PageEditor/Copilot/AgentSelector/AgentItem';
+import { useWorkspaceAwareNavigate } from '@/features/Workspace/useWorkspaceAwareNavigate';
 import { useFetchAgentList } from '@/hooks/useFetchAgentList';
 import { useAgentStore } from '@/store/agent';
 import { agentSelectors, builtinAgentSelectors } from '@/store/agent/selectors';
@@ -55,7 +53,7 @@ const styles = createStaticStyles(({ css }) => ({
 const MoveTopicsContent = memo<MoveTopicsContentProps>(({ onMoved, sourceAgentId, topicIds }) => {
   const { t } = useTranslation(['topic', 'chat', 'common']);
   const { close, setCanDismissByClickOutside } = useModalContext();
-  const navigate = useNavigate();
+  const navigate = useWorkspaceAwareNavigate();
 
   const [step, setStep] = useState<Step>('pick');
   const [search, setSearch] = useState('');
@@ -88,7 +86,7 @@ const MoveTopicsContent = memo<MoveTopicsContentProps>(({ onMoved, sourceAgentId
               description: null,
               id: inboxAgentId,
               pinned: false,
-              title: inboxMeta?.title || t('inbox.title', { ns: 'chat' }),
+              title: agentDisplayName(inboxMeta, t('inbox.title', { ns: 'chat' })),
               type: 'agent' as const,
               updatedAt: new Date(),
             },
@@ -101,7 +99,7 @@ const MoveTopicsContent = memo<MoveTopicsContentProps>(({ onMoved, sourceAgentId
   const filteredAgents = useMemo(() => {
     const q = search.trim().toLowerCase();
     if (!q) return targetAgents;
-    return targetAgents.filter((a) => (a.title || '').toLowerCase().includes(q));
+    return targetAgents.filter((a) => (agentDisplayName(a) ?? '').toLowerCase().includes(q));
   }, [targetAgents, search]);
 
   const handleConfirm = async () => {
@@ -115,7 +113,7 @@ const MoveTopicsContent = memo<MoveTopicsContentProps>(({ onMoved, sourceAgentId
       setStep('done');
     } catch (error) {
       console.error('[MoveTopics] move failed:', error);
-      message.error(t('management.moveModal.error'));
+      toast.error(t('management.moveModal.error'));
       setStep('confirm');
     } finally {
       setCanDismissByClickOutside?.(true);
@@ -149,15 +147,16 @@ const MoveTopicsContent = memo<MoveTopicsContentProps>(({ onMoved, sourceAgentId
             {filteredAgents.map((agent) => (
               <AgentItem
                 active={false}
+                agent={agent}
                 agentId={agent.id}
-                agentTitle={agent.title || t('untitledAgent', { ns: 'chat' })}
+                agentTitle={agentDisplayName(agent, t('untitledAgent', { ns: 'chat' }))}
                 avatar={agent.avatar}
                 key={agent.id}
                 onClose={() => {}}
                 onAgentChange={() => {
                   setTarget({
                     id: agent.id,
-                    title: agent.title || t('untitledAgent', { ns: 'chat' }),
+                    title: agentDisplayName(agent, t('untitledAgent', { ns: 'chat' })),
                   });
                   setStep('confirm');
                 }}
@@ -186,7 +185,7 @@ const MoveTopicsContent = memo<MoveTopicsContentProps>(({ onMoved, sourceAgentId
   if (step === 'moving') {
     return (
       <Flexbox align={'center'} gap={16} justify={'center'} padding={48}>
-        <NeuralNetworkLoading size={48} />
+        <Spin size="large" />
         <Text type={'secondary'}>{t('management.moveModal.moving')}</Text>
       </Flexbox>
     );
@@ -205,7 +204,7 @@ const MoveTopicsContent = memo<MoveTopicsContentProps>(({ onMoved, sourceAgentId
           <Button
             type={'primary'}
             onClick={() => {
-              navigate(SESSION_CHAT_URL(target.id));
+              navigate(AGENT_CHAT_URL(target.id));
               close();
             }}
           >

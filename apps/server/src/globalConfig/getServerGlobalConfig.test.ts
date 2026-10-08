@@ -16,8 +16,10 @@ const mocks = vi.hoisted(() => ({
 }));
 
 interface MockGlobalConfigOptions {
+  agentGatewayProtocol?: number;
   agentGatewayUrl?: string;
   enableAgentGateway?: boolean;
+  toolNameMaxLengthEnv?: string;
 }
 
 const mockGlobalConfigDependencies = (
@@ -38,6 +40,9 @@ const mockGlobalConfigDependencies = (
 
   vi.doMock('@/envs/app', () => ({
     appEnv: {
+      ...(options.agentGatewayProtocol === undefined
+        ? {}
+        : { AGENT_GATEWAY_PROTOCOL: options.agentGatewayProtocol }),
       ...(options.agentGatewayUrl ? { AGENT_GATEWAY_URL: options.agentGatewayUrl } : {}),
       ...(options.enableAgentGateway === undefined
         ? {}
@@ -80,7 +85,7 @@ const mockGlobalConfigDependencies = (
   }));
 
   vi.doMock('@/envs/tools', () => ({
-    toolsEnv: {},
+    toolsEnv: { TOOL_NAME_MAX_LENGTH: options.toolNameMaxLengthEnv },
   }));
 
   vi.doMock('@/libs/better-auth/utils/server', () => ({
@@ -195,5 +200,70 @@ describe('getServerGlobalConfig', () => {
     await expect(loadServerConfig(false, { enableAgentGateway: true })).resolves.toMatchObject({
       enableGatewayMode: false,
     });
+  });
+
+  it('should declare gateway protocol 2 only where the v2 socket exists', async () => {
+    // The business gateway serves `/v2/ws`; `lobehub/lobehub-gateway`, which is
+    // what a self-hosted deployment runs, serves only `/ws`.
+    await expect(loadServerConfig(true)).resolves.toMatchObject({ agentGatewayProtocol: 2 });
+    await expect(
+      loadServerConfig(false, {
+        agentGatewayUrl: 'https://gateway.test.com',
+        enableAgentGateway: true,
+      }),
+    ).resolves.toMatchObject({ agentGatewayProtocol: 1 });
+  });
+
+  it('should let AGENT_GATEWAY_PROTOCOL correct either guess', async () => {
+    await expect(
+      loadServerConfig(false, {
+        agentGatewayProtocol: 2,
+        agentGatewayUrl: 'https://gateway.test.com',
+        enableAgentGateway: true,
+      }),
+    ).resolves.toMatchObject({ agentGatewayProtocol: 2 });
+
+    // An on-prem business deployment sitting in front of a v1 gateway.
+    await expect(loadServerConfig(true, { agentGatewayProtocol: 1 })).resolves.toMatchObject({
+      agentGatewayProtocol: 1,
+    });
+  });
+
+  // The client-driven chat path builds tool names in the browser, so `0`
+  // (tool-name compression off) only takes effect if the server ships the value
+  // with the global config.
+  it('should expose TOOL_NAME_MAX_LENGTH to the client, including 0', async () => {
+    await expect(loadServerConfig(false, { toolNameMaxLengthEnv: '0' })).resolves.toMatchObject({
+      toolNameMaxLength: 0,
+    });
+
+    await expect(loadServerConfig(false, { toolNameMaxLengthEnv: '30' })).resolves.toMatchObject({
+      toolNameMaxLength: 30,
+    });
+
+    await expect(loadServerConfig(false)).resolves.toMatchObject({
+      toolNameMaxLength: undefined,
+    });
+  });
+
+  // The value shipped to the client must be parsed exactly like the resolver
+  // parses `process.env` on the server — same env value, same tool names on both
+  // sides — and a typo must never take the whole global config down.
+  it('should parse TOOL_NAME_MAX_LENGTH like the resolver, falling back instead of throwing', async () => {
+    const cases: [string, number | undefined][] = [
+      ['64', 64],
+      ['1e2', 1], // parseInt semantics, not Number()
+      ['2048', 2048], // no upper bound
+      [' ', undefined], // not `0`
+      ['-5', undefined],
+      ['abc', undefined],
+      ['', undefined],
+    ];
+
+    for (const [raw, expected] of cases) {
+      await expect(loadServerConfig(false, { toolNameMaxLengthEnv: raw })).resolves.toMatchObject({
+        toolNameMaxLength: expected,
+      });
+    }
   });
 });

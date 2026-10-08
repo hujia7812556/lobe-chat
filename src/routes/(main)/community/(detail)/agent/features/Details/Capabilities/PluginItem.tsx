@@ -4,9 +4,11 @@ import {
   type ComposioAppType,
   getLobehubSkillProviderById,
   type LobehubSkillProviderType,
+  OFFICIAL_SITE,
 } from '@lobechat/const';
 import { type DiscoverPluginDetail, type PluginSource } from '@lobechat/types';
-import { Avatar, Block, Flexbox, Icon, Image, Skeleton, Tag, Text } from '@lobehub/ui';
+import { Block, Flexbox, Icon, Image } from '@lobehub/ui';
+import { Avatar, Skeleton, Tag, Text } from '@lobehub/ui/base-ui';
 import { createStaticStyles, cssVar, cx } from 'antd-style';
 import { memo, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -124,7 +126,7 @@ const PluginItem = memo<PluginItemProps>(({ identifier }) => {
         category: undefined,
         createdAt: '',
         description: lobehubSkill.description,
-        homepage: lobehubSkill.authorUrl || 'https://lobehub.com',
+        homepage: lobehubSkill.authorUrl || OFFICIAL_SITE,
         identifier: lobehubSkill.id,
         manifest: undefined,
         related: [],
@@ -139,18 +141,18 @@ const PluginItem = memo<PluginItemProps>(({ identifier }) => {
     if (builtinTool) {
       return {
         author: 'LobeHub',
-        avatar: builtinTool.manifest.meta.avatar || '',
+        avatar: builtinTool.avatar || '',
         category: undefined,
         createdAt: '',
-        description: builtinTool.manifest.meta.description || '',
-        homepage: 'https://lobehub.com',
+        description: builtinTool.description || '',
+        homepage: OFFICIAL_SITE,
         identifier: builtinTool.identifier,
         manifest: undefined,
         related: [],
         schemaVersion: 1,
         source: 'builtin' as const,
-        tags: builtinTool.manifest.meta.tags || ['builtin-tool'],
-        title: builtinTool.manifest.meta.title,
+        tags: builtinTool.tags || ['builtin-tool'],
+        title: builtinTool.title || builtinTool.identifier,
       };
     }
 
@@ -196,7 +198,7 @@ const PluginItem = memo<PluginItemProps>(({ identifier }) => {
   if (isLoading)
     return (
       <Block horizontal gap={12} key={identifier} padding={12} variant={'outlined'}>
-        <Skeleton paragraph={{ rows: 1 }} title={false} />
+        <Skeleton.Text rows={1} />
       </Block>
     );
 

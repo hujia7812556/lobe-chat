@@ -1,6 +1,7 @@
-import { SUPPORT_TEXT_LIST } from '../file';
-import { SUPPORTED_LANGUAGES, type SupportedLanguage } from '../splitter';
-import { type DocumentChunk, type FileLoaderType } from '../types';
+import { convertIpynbToMarkdown, scrubIpynbFallbackText } from '@lobechat/file-loaders';
+
+import { getChunkingLoaderType } from '../loaderType';
+import { type DocumentChunk } from '../types';
 import { CodeLoader } from './code';
 import { CsVLoader } from './csv';
 import { DocxLoader } from './docx';
@@ -24,7 +25,7 @@ export class ChunkingLoader {
       const fileBlob = new Blob([Buffer.from(content)]);
       const txt = this.uint8ArrayToString(content);
 
-      const type = this.getType(filename?.toLowerCase());
+      const type = getChunkingLoaderType(filename ?? '');
 
       switch (type) {
         case 'code': {
@@ -64,6 +65,15 @@ export class ChunkingLoader {
           return await EPubLoader(content);
         }
 
+        case 'ipynb': {
+          // Notebook JSON → markdown so chunks carry semantic text instead
+          // of base64 payloads; non-nbformat-v4 files fall back to raw text.
+          const markdown = convertIpynbToMarkdown(txt);
+          return markdown === null
+            ? await TextLoader(scrubIpynbFallbackText(txt))
+            : await MarkdownLoader(markdown);
+        }
+
         default: {
           throw new Error(
             `Unsupported file type [${type}], please check your file is supported, or create report issue here: https://github.com/lobehub/lobe-chat/discussions/3550`,
@@ -73,44 +83,6 @@ export class ChunkingLoader {
     } catch (e) {
       throw new DocumentLoaderError((e as Error).message);
     }
-  };
-
-  private getType = (filename: string): FileLoaderType | undefined => {
-    if (filename.endsWith('pptx')) {
-      return 'ppt';
-    }
-
-    if (filename.endsWith('docx') || filename.endsWith('doc')) {
-      return 'doc';
-    }
-
-    if (filename.endsWith('pdf')) {
-      return 'pdf';
-    }
-
-    if (filename.endsWith('tex')) {
-      return 'latex';
-    }
-
-    if (filename.endsWith('md') || filename.endsWith('mdx')) {
-      return 'markdown';
-    }
-
-    if (filename.endsWith('csv')) {
-      return 'csv';
-    }
-
-    if (filename.endsWith('epub')) {
-      return 'epub';
-    }
-
-    const ext = filename.split('.').pop();
-
-    if (ext && SUPPORTED_LANGUAGES.includes(ext as SupportedLanguage)) {
-      return 'code';
-    }
-
-    if (ext && SUPPORT_TEXT_LIST.includes(ext)) return 'text';
   };
 
   private uint8ArrayToString(uint8Array: Uint8Array) {

@@ -4,6 +4,7 @@ import type { AgentSignalOperationMarker } from '@/server/services/agentSignal/o
 
 import type { AgentSignalReceipt } from '../../receiptService';
 import type { ToolResultWithKind } from '../finalStateExtractor';
+import type { Idea } from '../types';
 
 /**
  * Maps a durable mutation tool's api name to the user-facing receipt domain.
@@ -45,11 +46,22 @@ const DEFAULT_TITLE_BY_API: Record<string, string> = {
   writeMemory: 'Memory saved',
 };
 
+const ROLLBACK_CAPABLE_APIS = new Set(['replaceSkillContentCAS']);
+
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
 
 const str = (value: unknown): string | undefined =>
   typeof value === 'string' && value.length > 0 ? value : undefined;
+
+const getIdeas = (artifacts: ToolResultWithKind[]): Idea[] =>
+  artifacts.flatMap((artifact) => {
+    if (artifact.apiName !== 'recordSelfReviewIdea' || !isRecord(artifact.data)) return [];
+    const value = isRecord(artifact.data.idea) ? artifact.data.idea : artifact.data;
+    return typeof value.idempotencyKey === 'string' && typeof value.rationale === 'string'
+      ? [value as unknown as Idea]
+      : [];
+  });
 
 /** A `skipped_unsupported` / `skipped_stale` tool status collapses to `skipped`. */
 const isSkippedStatus = (status: unknown): boolean =>
@@ -139,6 +151,15 @@ export const buildSelfIterationReceipts = (
     kind: 'review',
     metadata: {
       actionCount: mutations.length,
+      ...(artifacts.length > 0
+        ? {
+            selfIteration: {
+              ideas: getIdeas(artifacts),
+              mode: 'review' as const,
+              sourceId,
+            },
+          }
+        : {}),
       ...(marker.localDate ? { localDate: marker.localDate } : {}),
       sourceType,
     },
@@ -158,13 +179,25 @@ export const buildSelfIterationReceipts = (
 
     const target = isRecord(data.target) ? data.target : undefined;
     const targetId = str(target?.id) ?? str(data.resourceId);
+    const agentDocumentId = kind === 'skill' ? str(target?.agentDocumentId) : undefined;
+    const documentId = kind === 'skill' ? str(target?.documentId) : undefined;
     const memoryId = kind === 'memory' ? str(target?.memoryId) : undefined;
     const memoryLayer =
       kind === 'memory' && isMemoryLayer(target?.memoryLayer) ? target.memoryLayer : undefined;
+    const rollbackAgentDocumentId = str(data.agentDocumentId);
+    const rollbackDocumentId = str(data.documentId);
+    const rollbackExpectedCurrentDocumentUpdatedAt = str(data.expectedCurrentDocumentUpdatedAt);
+    const rollbackHistoryId = str(data.historyId);
     const summaryText = str(data.summary);
     const targetTitle = str(target?.title);
     const title =
       targetTitle ?? summaryText ?? DEFAULT_TITLE_BY_API[apiName] ?? 'Agent Signal action';
+    const rollbackAvailable =
+      rollbackDocumentId &&
+      rollbackExpectedCurrentDocumentUpdatedAt &&
+      rollbackHistoryId &&
+      status === 'applied' &&
+      ROLLBACK_CAPABLE_APIS.has(apiName);
 
     return [
       {
@@ -174,7 +207,14 @@ export const buildSelfIterationReceipts = (
         id: `${sourceId}:${mutation.toolCallId ?? `${apiName}:${index}`}:${kind}`,
         kind,
         metadata: {
+          ...(rollbackAgentDocumentId ? { agentDocumentId: rollbackAgentDocumentId } : {}),
+          ...(rollbackDocumentId ? { documentId: rollbackDocumentId } : {}),
+          ...(rollbackExpectedCurrentDocumentUpdatedAt
+            ? { expectedCurrentDocumentUpdatedAt: rollbackExpectedCurrentDocumentUpdatedAt }
+            : {}),
+          ...(rollbackHistoryId ? { historyId: rollbackHistoryId } : {}),
           ...(marker.localDate ? { localDate: marker.localDate } : {}),
+          ...(rollbackAvailable ? { rollbackStatus: 'available' as const } : {}),
           sourceType,
         },
         status,
@@ -183,6 +223,8 @@ export const buildSelfIterationReceipts = (
           ? {}
           : {
               target: {
+                ...(agentDocumentId ? { agentDocumentId } : {}),
+                ...(documentId ? { documentId } : {}),
                 ...(targetId ? { id: targetId } : {}),
                 ...(memoryId ? { memoryId } : {}),
                 ...(memoryLayer ? { memoryLayer } : {}),

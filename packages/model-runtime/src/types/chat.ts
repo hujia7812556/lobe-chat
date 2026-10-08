@@ -1,5 +1,12 @@
-import type { ModelPerformance, ModelTokensUsage, ModelUsage } from '@lobechat/types';
+import type {
+  ModelPerformance,
+  ModelReasoning,
+  ModelTokensUsage,
+  ModelUsage,
+} from '@lobechat/types';
 
+import type { ModelPricingContext } from './pricing';
+import type { ModelRuntimeDiagnostics } from './providerDiagnostics';
 import type { MessageToolCall, MessageToolCallChunk } from './toolsCalling';
 
 export type LLMRoleType = 'user' | 'system' | 'assistant' | 'function' | 'tool';
@@ -20,6 +27,10 @@ interface UserMessageContentPartThinking {
   thinking: string;
   type: 'thinking';
 }
+interface UserMessageContentPartRedactedThinking {
+  data: string;
+  type: 'redacted_thinking';
+}
 interface UserMessageContentPartText {
   text: string;
   type: 'text';
@@ -38,7 +49,12 @@ interface UserMessageContentPartVideo {
   video_url: { url: string };
 }
 interface UserMessageContentPartAudio {
-  audio_url: { url: string };
+  audio_url: {
+    codec?: string;
+    durationMs?: number;
+    mimeType?: string;
+    url: string;
+  };
   type: 'audio_url';
 }
 
@@ -47,15 +63,15 @@ export type UserMessageContentPart =
   | UserMessageContentPartImage
   | UserMessageContentPartVideo
   | UserMessageContentPartAudio
-  | UserMessageContentPartThinking;
+  | UserMessageContentPartThinking
+  | UserMessageContentPartRedactedThinking;
 
 export interface OpenAIChatMessage {
   content: string | UserMessageContentPart[];
+  model?: string;
   name?: string;
-  reasoning?: {
-    content?: string;
-    duration?: number;
-  };
+  provider?: string;
+  reasoning?: ModelReasoning;
   reasoning_content?: string;
   role: LLMRoleType;
   tool_call_id?: string;
@@ -133,6 +149,7 @@ export interface ChatStreamPayload {
   provider?: string;
   reasoning?: {
     effort?: string;
+    mode?: 'standard' | 'pro';
     summary?: string;
   };
   reasoning_effort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
@@ -156,6 +173,14 @@ export interface ChatStreamPayload {
    */
   thinking?: {
     budget_tokens?: number;
+    /**
+     * Controls whether the summarized reasoning text is returned. Defaults to `omitted` on
+     * Claude Fable 5 / Opus 5 / Sonnet 5 / Opus 4.8 / Opus 4.7, where thinking blocks then
+     * arrive with an empty `thinking` field and no `thinking_delta` events while streaming.
+     * Invalid together with `type: 'disabled'`.
+     * @see https://platform.claude.com/docs/en/build-with-claude/thinking#controlling-thinking-display
+     */
+    display?: 'omitted' | 'summarized';
     type?: 'enabled' | 'disabled' | 'adaptive';
   };
   thinkingBudget?: number;
@@ -182,11 +207,19 @@ export interface ChatStreamPayload {
 export interface ChatMethodOptions {
   callback?: ChatStreamCallbacks;
   /**
+   * Request-scoped provider-boundary evidence retained by the caller.
+   * Keep this separate from metadata because routing hooks may retain metadata
+   * after the provider returns, while diagnostics can contain a large payload.
+   */
+  diagnostics?: ModelRuntimeDiagnostics;
+  /**
    * response headers
    */
   headers?: Record<string, any>;
   /** Metadata passed to hooks (billing, tracing, etc.) */
   metadata?: Record<string, unknown>;
+  /** Request-scoped pricing context for model-bank pricing lookups. */
+  pricingContext?: ModelPricingContext;
   /**
    * send the request to the ai api endpoint
    */
@@ -240,6 +273,13 @@ export interface OnFinishData {
    */
   finishReason?: string;
   grounding?: any;
+  reasoning?: ModelReasoning;
+  /** Stable identities and terminal outcome for the provider attempt producing this result. */
+  routeAttempt?: {
+    attemptId: string;
+    outcome?: 'completed' | 'empty' | 'interrupted' | 'cancelled' | 'failed';
+    requestId: string;
+  };
   speed?: ModelPerformance;
   text: string;
   thinking?: string;
@@ -258,10 +298,7 @@ export interface UsageMissingDiagnostics {
   provider?: string;
   responseId?: string;
   source:
-    | 'anthropic_messages'
-    | 'google_generative_ai'
-    | 'openai_chat_completions'
-    | 'openai_responses';
+    'anthropic_messages' | 'google_generative_ai' | 'openai_chat_completions' | 'openai_responses';
   terminalEventType: string;
   terminalStatus?: string;
 }

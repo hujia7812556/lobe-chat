@@ -1,7 +1,15 @@
 import type { BuiltinToolManifest } from '@lobechat/types';
 
 import { systemPrompt } from './systemRole';
-import { AgentDocumentsApiName, AgentDocumentsIdentifier } from './types';
+import {
+  AgentDocumentsApiName,
+  AgentDocumentsIdentifier,
+  LIST_DOCUMENTS_DEFAULT_LIMIT,
+  LIST_DOCUMENTS_MAX_LIMIT,
+} from './types';
+
+const AGENT_DOCUMENT_ID_DESCRIPTION =
+  'Target agent document ID. Use the "id" field returned by listDocuments, not "documentId".';
 
 export const AgentDocumentsManifest: BuiltinToolManifest = {
   api: [
@@ -12,7 +20,8 @@ export const AgentDocumentsManifest: BuiltinToolManifest = {
       parameters: {
         properties: {
           content: {
-            description: 'Document content in markdown or plain text.',
+            description:
+              'Document content in Markdown. Put JSON, code or any text that must stay byte-exact inside a fenced code block (```json … ```); outside code, Markdown syntax such as `\\`, `__` or `*` is interpreted.',
             type: 'string',
           },
           hintIsSkill: {
@@ -20,6 +29,11 @@ export const AgentDocumentsManifest: BuiltinToolManifest = {
             description:
               'Set true only when the document captures reusable procedural knowledge or durable agent behavior.',
             type: 'boolean',
+          },
+          parentId: {
+            description:
+              'Parent folder document ID. Use the "documentId" field returned for a folder by listDocuments. Omit to create at the root.',
+            type: 'string',
           },
           scope: {
             default: 'agent',
@@ -36,10 +50,14 @@ export const AgentDocumentsManifest: BuiltinToolManifest = {
         required: ['title', 'content'],
         type: 'object',
       },
+      work: {
+        action: 'create',
+        resourceType: 'document',
+      },
     },
     {
       description:
-        'Read an existing agent document by ID. Prefer XML format before node-level edits because XML includes stable node IDs.',
+        'Read an existing agent document by ID. Prefer XML format before node-level edits because XML includes stable node IDs. Long documents are returned one window at a time; a partial read ends with the offset to continue from.',
       name: AgentDocumentsApiName.readDocument,
       parameters: {
         properties: {
@@ -51,8 +69,18 @@ export const AgentDocumentsManifest: BuiltinToolManifest = {
             type: 'string',
           },
           id: {
-            description: 'Target document ID.',
+            description: AGENT_DOCUMENT_ID_DESCRIPTION,
             type: 'string',
+          },
+          limit: {
+            description:
+              'Maximum number of lines to return. Omit to read as much as fits in one response.',
+            type: 'integer',
+          },
+          offset: {
+            description:
+              '1-based line to start reading from. Use the offset given at the end of a partial read to continue.',
+            type: 'integer',
           },
         },
         required: ['id'],
@@ -66,16 +94,21 @@ export const AgentDocumentsManifest: BuiltinToolManifest = {
       parameters: {
         properties: {
           content: {
-            description: 'New full document content.',
+            description:
+              'New full document content in Markdown. Put JSON, code or any text that must stay byte-exact inside a fenced code block (```json … ```).',
             type: 'string',
           },
           id: {
-            description: 'Target document ID.',
+            description: AGENT_DOCUMENT_ID_DESCRIPTION,
             type: 'string',
           },
         },
         required: ['id', 'content'],
         type: 'object',
+      },
+      work: {
+        action: 'update',
+        resourceType: 'document',
       },
     },
     {
@@ -85,7 +118,7 @@ export const AgentDocumentsManifest: BuiltinToolManifest = {
       parameters: {
         properties: {
           id: {
-            description: 'Target document ID.',
+            description: AGENT_DOCUMENT_ID_DESCRIPTION,
             type: 'string',
           },
           operations: {
@@ -140,6 +173,10 @@ export const AgentDocumentsManifest: BuiltinToolManifest = {
         required: ['id', 'operations'],
         type: 'object',
       },
+      work: {
+        action: 'update',
+        resourceType: 'document',
+      },
     },
     {
       description: 'Remove an existing agent document by ID (similar intent to rm/delete).',
@@ -147,12 +184,16 @@ export const AgentDocumentsManifest: BuiltinToolManifest = {
       parameters: {
         properties: {
           id: {
-            description: 'Target document ID.',
+            description: AGENT_DOCUMENT_ID_DESCRIPTION,
             type: 'string',
           },
         },
         required: ['id'],
         type: 'object',
+      },
+      work: {
+        action: 'delete',
+        resourceType: 'document',
       },
     },
     {
@@ -162,7 +203,7 @@ export const AgentDocumentsManifest: BuiltinToolManifest = {
       parameters: {
         properties: {
           id: {
-            description: 'Target document ID.',
+            description: AGENT_DOCUMENT_ID_DESCRIPTION,
             type: 'string',
           },
           newTitle: {
@@ -172,6 +213,10 @@ export const AgentDocumentsManifest: BuiltinToolManifest = {
         },
         required: ['id', 'newTitle'],
         type: 'object',
+      },
+      work: {
+        action: 'update',
+        resourceType: 'document',
       },
     },
     {
@@ -191,13 +236,31 @@ export const AgentDocumentsManifest: BuiltinToolManifest = {
         required: ['id'],
         type: 'object',
       },
+      work: {
+        action: 'create',
+        resourceType: 'document',
+      },
     },
     {
       description:
-        'List agent documents. Use this to discover documents that are not auto-injected (e.g. web-crawled pages) or to resolve a title to a document ID.',
+        "List agent documents (this agent's own notes/skills/structured docs). Use this to discover documents that are not auto-injected (e.g. web-crawled pages), to expand a folder collapsed in the agent_documents_index, or to resolve a title to a document ID. Do NOT use this to find the user's uploaded files (PDFs, images, general uploads) — those live in the resource library and are covered by the Knowledge Base tool's listFiles, not here.",
       name: AgentDocumentsApiName.listDocuments,
       parameters: {
         properties: {
+          limit: {
+            description: `Maximum number of documents to return (default ${LIST_DOCUMENTS_DEFAULT_LIMIT}, max ${LIST_DOCUMENTS_MAX_LIMIT}).`,
+            type: 'number',
+          },
+          offset: {
+            description:
+              'Number of documents to skip. Use the offset given at the end of a truncated listing to fetch the next page.',
+            type: 'number',
+          },
+          parentId: {
+            description:
+              'Restrict the listing to the direct children of this folder. Pass the folder id shown on a collapsed 📁 row in the agent_documents_index to expand that folder.',
+            type: 'string',
+          },
           scope: {
             default: 'agent',
             description:
@@ -207,8 +270,7 @@ export const AgentDocumentsManifest: BuiltinToolManifest = {
           },
           sourceType: {
             default: 'all',
-            description:
-              'Filter by document source. "file" = user-created or uploaded; "web" = crawled from external URLs; "all" returns both. Web-crawled documents are hidden from the default agent_documents_index — pass sourceType="web" here to see them.',
+            description: `Filter by document source within this agent-document system (unrelated to the user's resource library uploads). "file" = every non-web agent document (authored or edited as agent documents, plus uploaded originals); "web" = crawled from external URLs; "all" returns both. Web-crawled documents are hidden from the default agent_documents_index — pass sourceType="web" here to see them.`,
             enum: ['all', 'file', 'web'],
             type: 'string',
           },
@@ -224,7 +286,7 @@ export const AgentDocumentsManifest: BuiltinToolManifest = {
       parameters: {
         properties: {
           id: {
-            description: 'Target document ID.',
+            description: AGENT_DOCUMENT_ID_DESCRIPTION,
             type: 'string',
           },
           rule: {
@@ -253,7 +315,7 @@ export const AgentDocumentsManifest: BuiltinToolManifest = {
   meta: {
     avatar: '🗂️',
     description:
-      'Manage agent-scoped documents (list/create/read/edit/remove/rename/copy/upsert) and load rules',
+      "Manage agent-scoped documents (list/create/read/edit/remove/rename/copy/upsert) and load rules. Not for the user's uploaded files — use the Knowledge Base tool for those.",
     title: 'Documents',
   },
   systemRole: systemPrompt,

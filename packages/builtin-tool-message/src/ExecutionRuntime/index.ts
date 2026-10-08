@@ -45,21 +45,30 @@ import type {
   MessengerInfo,
   MessengerLinkInfo,
   MessengerPlatformInfo,
+  MessengerPushPlatformType,
+  MessengerPushStatus,
+  MessengerPushWorkspaceOption,
   PinMessageParams,
   PinMessageState,
   PlatformInfo,
   ReactToMessageParams,
   ReactToMessageState,
+  ReadDocumentParams,
+  ReadDocumentState,
   ReadMessagesParams,
   ReadMessagesState,
   ReplyToThreadParams,
   ReplyToThreadState,
   SearchMessagesParams,
   SearchMessagesState,
+  SendAttachmentsOutcome,
   SendDirectMessageParams,
   SendDirectMessageState,
+  SendMessageAttachment,
   SendMessageParams,
   SendMessageState,
+  SendMessengerPushParams,
+  SendMessengerPushState,
   SetMessengerActiveAgentParams,
   SetMessengerActiveAgentState,
   ToggleBotParams,
@@ -117,14 +126,20 @@ export type {
   ListPlatformsState,
   ListThreadsParams,
   ListThreadsState,
+  MessageSendRoute,
   MessengerInfo,
   MessengerLinkInfo,
   MessengerPlatformInfo,
+  MessengerPushPlatformType,
+  MessengerPushStatus,
+  MessengerPushWorkspaceOption,
   PinMessageParams,
   PinMessageState,
   PlatformInfo,
   ReactToMessageParams,
   ReactToMessageState,
+  ReadDocumentParams,
+  ReadDocumentState,
   ReadMessagesParams,
   ReadMessagesState,
   ReplyToThreadParams,
@@ -136,6 +151,8 @@ export type {
   SendMessageAttachment,
   SendMessageParams,
   SendMessageState,
+  SendMessengerPushParams,
+  SendMessengerPushState,
   SetMessengerActiveAgentParams,
   SetMessengerActiveAgentState,
   ToggleBotParams,
@@ -169,6 +186,12 @@ export interface MessageRuntimeService {
   listThreads: (params: ListThreadsParams) => Promise<ListThreadsState>;
   pinMessage: (params: PinMessageParams) => Promise<PinMessageState>;
   reactToMessage: (params: ReactToMessageParams) => Promise<ReactToMessageState>;
+  /**
+   * Read a cloud document linked from the chat. Optional: only platforms
+   * with a document API (Feishu/Lark docx) implement it; the runtime reports
+   * "not supported" elsewhere and `messageCapabilities` trims the tool.
+   */
+  readDocument?: (params: ReadDocumentParams) => Promise<ReadDocumentState>;
   readMessages: (params: ReadMessagesParams) => Promise<ReadMessagesState>;
   replyToThread: (params: ReplyToThreadParams) => Promise<ReplyToThreadState>;
   searchMessages: (params: SearchMessagesParams) => Promise<SearchMessagesState>;
@@ -205,6 +228,16 @@ export interface BotProviderQuery {
   /** User's workspace-scoped System Bot installs. */
   listMessengers?: () => Promise<MessengerInfo[]>;
   listPlatforms: () => Promise<PlatformInfo[]>;
+  /**
+   * Proactively push a message to the caller's own linked messenger DM.
+   * Mirrors `messenger.sendMessengerPush` — the runtime resolves Slack
+   * workspace ambiguity BEFORE calling this, so the handler only sees
+   * deliverable requests.
+   */
+  sendMessengerPush?: (params: SendMessengerPushParams) => Promise<{
+    remaining?: number;
+    status: Exclude<MessengerPushStatus, 'needs_workspace_selection'>;
+  }>;
   /** Change which agent receives inbound IM on a link. */
   setMessengerActiveAgent?: (params: SetMessengerActiveAgentParams) => Promise<void>;
   toggleBot: (botId: string, enabled: boolean) => Promise<void>;
@@ -223,6 +256,50 @@ export interface MessageExecutionRuntimeOptions {
   service: MessageRuntimeService;
 }
 
+/**
+ * Turn a send state's attachment outcome into what the model must read.
+ *
+ * Attachment failures are swallowed per item on purpose so the text leg still
+ * ships — but a `success: true` that says nothing about them is how the model
+ * ends up telling the user "see attached" about a file that never arrived.
+ * The failed attachments are named, with the reason, and the model is told
+ * to fall back to a download link instead of claiming delivery.
+ *
+ * `success` stays true while SOMETHING reached the user (text, an embed, or
+ * at least one attachment). When there was no text and every attachment failed, nothing was
+ * delivered and the call is reported as failed.
+ */
+const describeAttachmentOutcome = (
+  params: { attachments?: SendMessageAttachment[]; content?: string; embeds?: unknown[] },
+  state: SendAttachmentsOutcome,
+  /** The success line, used verbatim while something reached the user. */
+  sentLine: string,
+): { content: string; success: boolean } => {
+  const failures = state.attachmentFailures ?? [];
+  if (failures.length === 0) return { content: sentLine, success: true };
+
+  const requested = params.attachments?.length ?? failures.length;
+  const lines = failures.map(
+    (f) =>
+      `- "${f.name ?? '(unnamed)'}" (${f.type}): ${f.reason}${f.detail ? ` — ${f.detail}` : ''}`,
+  );
+  // Embeds ride the text leg (Discord posts them even with empty content), so
+  // a delivered embed counts as something reaching the user.
+  const nothingDelivered =
+    (state.attachmentsDelivered ?? 0) === 0 && !params.content?.trim() && !params.embeds?.length;
+  const content = [
+    // Never open with "Message sent" when nothing was: the lead line is what a
+    // skimming model reads first.
+    nothingDelivered ? 'Nothing was delivered.' : sentLine,
+    `WARNING: ${failures.length} of ${requested} attachment(s) were NOT delivered:`,
+    ...lines,
+    nothingDelivered
+      ? 'No text or embed was given and every attachment failed, so the user received nothing. Do not tell them a file was sent.'
+      : 'Only the text (and any attachments not listed above) reached the user. Do NOT claim these files were attached — tell the user which files could not be delivered and share a download link for each instead.',
+  ].join('\n');
+  return { content, success: !nothingDelivered };
+};
+
 export class MessageExecutionRuntime {
   private botProvider?: BotProviderQuery;
   private service: MessageRuntimeService;
@@ -237,11 +314,12 @@ export class MessageExecutionRuntime {
   async sendMessage(params: SendMessageParams): Promise<BuiltinServerRuntimeOutput> {
     try {
       const result = await this.service.sendMessage(params);
-      return {
-        content: `Message sent to ${params.platform}:${params.channelId} (messageId: ${result.messageId})`,
-        state: result,
-        success: true,
-      };
+      const outcome = describeAttachmentOutcome(
+        params,
+        result,
+        `Message sent to ${params.platform}:${params.channelId} (messageId: ${result.messageId})`,
+      );
+      return { content: outcome.content, state: result, success: outcome.success };
     } catch (e) {
       return {
         content: `sendMessage error: ${(e as Error).message}`,
@@ -271,6 +349,46 @@ export class MessageExecutionRuntime {
     } catch (e) {
       return {
         content: `readMessages error: ${(e as Error).message}`,
+        success: false,
+      };
+    }
+  }
+
+  async readDocument(params: ReadDocumentParams): Promise<BuiltinServerRuntimeOutput> {
+    if (!this.service.readDocument) {
+      return {
+        content: `readDocument is not supported on ${params.platform}`,
+        success: false,
+      };
+    }
+    if (!params.url && !params.documentId) {
+      return {
+        content: 'readDocument error: pass the document `url` (preferred) or its `documentId`',
+        success: false,
+      };
+    }
+    try {
+      const result = await this.service.readDocument(params);
+      const header = [
+        `Document${result.title ? `: ${result.title}` : ''}`,
+        result.url ? `URL: ${result.url}` : undefined,
+        result.documentId
+          ? `ID: ${result.documentId}${result.kind ? ` (${result.kind})` : ''}`
+          : undefined,
+      ]
+        .filter(Boolean)
+        .join('\n');
+      const truncatedHint = result.truncated
+        ? '\n\n[Content truncated — the document is longer than what fits here]'
+        : '';
+      return {
+        content: `${header}\n\n${result.content?.trim() || '(empty document)'}${truncatedHint}`,
+        state: result,
+        success: true,
+      };
+    } catch (e) {
+      return {
+        content: `readDocument error: ${(e as Error).message}`,
         success: false,
       };
     }
@@ -512,11 +630,12 @@ export class MessageExecutionRuntime {
   async replyToThread(params: ReplyToThreadParams): Promise<BuiltinServerRuntimeOutput> {
     try {
       const result = await this.service.replyToThread(params);
-      return {
-        content: `Reply sent to thread ${params.threadId} (messageId: ${result.messageId})`,
-        state: result,
-        success: true,
-      };
+      const outcome = describeAttachmentOutcome(
+        params,
+        result,
+        `Reply sent to thread ${params.threadId} (messageId: ${result.messageId})`,
+      );
+      return { content: outcome.content, state: result, success: outcome.success };
     } catch (e) {
       return {
         content: `replyToThread error: ${(e as Error).message}`,
@@ -554,11 +673,12 @@ export class MessageExecutionRuntime {
     }
     try {
       const result = await this.service.sendDirectMessage(params);
-      return {
-        content: `Direct message sent to user ${params.userId} on ${params.platform} (messageId: ${result.messageId})`,
-        state: result,
-        success: true,
-      };
+      const outcome = describeAttachmentOutcome(
+        params,
+        result,
+        `Direct message sent to user ${params.userId} on ${params.platform} (messageId: ${result.messageId})`,
+      );
+      return { content: outcome.content, state: result, success: outcome.success };
     } catch (e) {
       return {
         content: `sendDirectMessage error: ${(e as Error).message}`,
@@ -755,7 +875,7 @@ export class MessageExecutionRuntime {
       if (installations.length === 0) {
         return {
           content:
-            'No System Bot installations connected. Tell the user to install via Settings → Messenger; `listMessengerPlatforms` shows what platforms are available.',
+            'No System Bot connections found. Tell the user to connect one via Settings → Messenger; `listMessengerPlatforms` shows what platforms are available.',
           state: { installations } satisfies ListMessengersState,
           success: true,
         };
@@ -771,7 +891,7 @@ export class MessageExecutionRuntime {
         return `- ${parts.join(', ')}`;
       });
       return {
-        content: `${installations.length} System Bot installation(s):\n${lines.join('\n')}`,
+        content: `${installations.length} System Bot connection(s):\n${lines.join('\n')}`,
         state: { installations } satisfies ListMessengersState,
         success: true,
       };
@@ -825,7 +945,7 @@ export class MessageExecutionRuntime {
     try {
       await this.botProvider.uninstallMessenger(params.installationId);
       return {
-        content: `Workspace install ${params.installationId} revoked. The bot is now disconnected for everyone in that workspace.`,
+        content: `System Bot connection ${params.installationId} disconnected.`,
         state: { success: true } satisfies UninstallMessengerState,
         success: true,
       };
@@ -938,6 +1058,123 @@ export class MessageExecutionRuntime {
       };
     } catch (e) {
       return { content: `unlinkMessenger error: ${(e as Error).message}`, success: false };
+    }
+  }
+
+  // ==================== Proactive Messenger Push ====================
+
+  /**
+   * Resolve the Slack workspace a push should target when the caller didn't
+   * pass `tenantId`. Returns the single linked tenantId, or the candidate
+   * list when the choice is ambiguous (the user linked several workspaces).
+   */
+  private async resolveSlackPushTenant(): Promise<
+    { tenantId?: string } | { workspaces: MessengerPushWorkspaceOption[] }
+  > {
+    const links = (await this.botProvider!.listMessengerLinks?.()) ?? [];
+    const slackTenantIds = links
+      .filter((link) => link.platform === 'slack' && link.tenantId)
+      .map((link) => link.tenantId!);
+    if (slackTenantIds.length <= 1) return { tenantId: slackTenantIds[0] };
+
+    // Enrich with workspace names so the agent can present readable choices;
+    // installs may be missing (installed by a teammate) — fall back to the id.
+    const installs = await this.botProvider!.listMessengers?.().catch(() => []);
+    const nameByTenant = new Map(
+      (installs ?? [])
+        .filter((install) => install.platform === 'slack')
+        .map((install) => [install.tenantId, install.tenantName]),
+    );
+    return {
+      workspaces: slackTenantIds.map((tenantId) => ({
+        tenantId,
+        tenantName: nameByTenant.get(tenantId) || undefined,
+      })),
+    };
+  }
+
+  async sendMessengerPush(params: SendMessengerPushParams): Promise<BuiltinServerRuntimeOutput> {
+    if (!this.botProvider?.sendMessengerPush) {
+      return { content: 'sendMessengerPush is not available.', success: false };
+    }
+    const platform = params.platform as MessengerPushPlatformType;
+    try {
+      let tenantId = params.tenantId;
+
+      // Slack links can span several workspaces — never pick one silently.
+      if (platform === 'slack' && tenantId === undefined) {
+        const resolved = await this.resolveSlackPushTenant();
+        if ('workspaces' in resolved) {
+          const lines = resolved.workspaces.map(
+            (w) => `- ${w.tenantName ?? w.tenantId} (tenantId: ${w.tenantId})`,
+          );
+          return {
+            content:
+              `The user's Slack account is linked to ${resolved.workspaces.length} workspaces:\n${lines.join('\n')}\n\n` +
+              'Ask the user which workspace to push to, then call sendMessengerPush again with that tenantId.',
+            state: {
+              platform,
+              status: 'needs_workspace_selection',
+              workspaces: resolved.workspaces,
+            } satisfies SendMessengerPushState,
+            success: true,
+          };
+        }
+        tenantId = resolved.tenantId;
+      }
+
+      const result = await this.botProvider.sendMessengerPush({
+        content: params.content,
+        platform,
+        tenantId,
+      });
+      const state: SendMessengerPushState = {
+        platform,
+        remaining: result.remaining,
+        status: result.status,
+        tenantId,
+      };
+
+      switch (result.status) {
+        case 'sent': {
+          const quota =
+            platform === 'wechat' && result.remaining !== undefined
+              ? ` (${result.remaining} sends left in the current WeChat window)`
+              : '';
+          return {
+            content: `Message pushed to the user's ${platform} DM${quota}.`,
+            state,
+            success: true,
+          };
+        }
+        case 'queued': {
+          return {
+            // Queued is a success: delivery is deferred, not dropped. The
+            // agent must relay the "message the bot first" step to the user.
+            content:
+              'The WeChat send window is closed or its quota is exhausted, so the message was queued. ' +
+              'Tell the user to send any message to the LobeHub WeChat bot first — the queued push will be delivered right after their message opens a new window.',
+            state,
+            success: true,
+          };
+        }
+        case 'unlinked': {
+          return {
+            content: `The user has no linked ${platform} account for the LobeHub System Bot. Ask them to open Settings → Messenger and connect ${platform} first.`,
+            state,
+            success: false,
+          };
+        }
+        default: {
+          return {
+            content: `Proactive push to ${platform} is currently unavailable — the platform is not configured on this deployment or delivery failed. Do not retry immediately; surface this to the user.`,
+            state,
+            success: false,
+          };
+        }
+      }
+    } catch (e) {
+      return { content: `sendMessengerPush error: ${(e as Error).message}`, success: false };
     }
   }
 }

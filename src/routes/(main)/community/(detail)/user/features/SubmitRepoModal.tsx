@@ -1,10 +1,12 @@
 'use client';
 
-import { Flexbox, Modal, Text } from '@lobehub/ui';
-import { App, Form, Input } from 'antd';
+import { Flexbox } from '@lobehub/ui';
+import { Input, Text, toast } from '@lobehub/ui/base-ui';
+import { Form, useForm } from '@lobehub/ui/base-ui/form';
 import { memo, useCallback, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
+import ImperativeModal from '@/components/ImperativeModal';
 import { lambdaClient } from '@/libs/trpc/client';
 
 interface SubmitRepoModalProps {
@@ -19,15 +21,16 @@ const GITHUB_URL_REGEX = /^https?:\/\/github\.com\/[\w-]+\/[\w.-]+\/?$/;
 export const SubmitRepoModal = memo<SubmitRepoModalProps>(
   ({ open, onClose, onSuccess, beforeSubmit }) => {
     const { t } = useTranslation('discover');
-    const { message } = App.useApp();
-    const [form] = Form.useForm();
+
+    const form = useForm<{ gitUrl?: string }>();
 
     const [isSubmitting, setIsSubmitting] = useState(false);
 
     const handleSubmit = useCallback(async () => {
       try {
-        const values = await form.validateFields();
-        const gitUrl = values.gitUrl?.trim();
+        const { valid } = await form.validate();
+        if (!valid) return;
+        const gitUrl = form.getValue('gitUrl')?.trim();
 
         if (!gitUrl) {
           return;
@@ -43,25 +46,25 @@ export const SubmitRepoModal = memo<SubmitRepoModalProps>(
           type: 'skill',
         });
 
-        message.success(t('user.submitRepoSuccess'));
+        toast.success(t('user.submitRepoSuccess'));
         onSuccess?.();
         onClose();
-        form.resetFields();
+        form.reset();
       } catch (error) {
         console.error('[SubmitRepoModal] Failed to submit:', error);
-        message.error(error instanceof Error ? error.message : t('user.submitRepoError'));
+        toast.error(error instanceof Error ? error.message : t('user.submitRepoError'));
       } finally {
         setIsSubmitting(false);
       }
-    }, [beforeSubmit, form, message, t, onSuccess, onClose]);
+    }, [beforeSubmit, form, t, onSuccess, onClose]);
 
     const handleCancel = useCallback(() => {
-      form.resetFields();
+      form.reset();
       onClose();
     }, [form, onClose]);
 
     return (
-      <Modal
+      <ImperativeModal
         centered
         cancelText={t('user.cancel')}
         confirmLoading={isSubmitting}
@@ -80,19 +83,16 @@ export const SubmitRepoModal = memo<SubmitRepoModalProps>(
         </Text>
 
         <Form form={form} layout="vertical">
-          <Form.Item
+          <Form.Field
             label={t('user.githubUrl')}
             name="gitUrl"
-            rules={[
-              { required: true, message: t('user.githubUrlRequired') },
-              {
-                pattern: GITHUB_URL_REGEX,
-                message: t('user.githubUrlInvalid'),
-              },
-            ]}
+            required={t('user.githubUrlRequired')}
+            validate={(value: string) =>
+              value && !GITHUB_URL_REGEX.test(value) ? t('user.githubUrlInvalid') : undefined
+            }
           >
             <Input placeholder="https://github.com/username/repo" />
-          </Form.Item>
+          </Form.Field>
         </Form>
 
         <Flexbox style={{ marginTop: 8 }}>
@@ -100,7 +100,7 @@ export const SubmitRepoModal = memo<SubmitRepoModalProps>(
             {t('user.submitRepoHint')}
           </Text>
         </Flexbox>
-      </Modal>
+      </ImperativeModal>
     );
   },
 );

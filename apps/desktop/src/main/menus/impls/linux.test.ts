@@ -1,3 +1,4 @@
+import { DOWNLOAD_URL } from '@lobechat/const/url';
 import { app, BrowserWindow, dialog, Menu, shell } from 'electron';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -39,6 +40,8 @@ const createMockApp = () => {
       'file.preferences': 'Preferences',
       'file.quit': 'Quit',
       'common.checkUpdates': 'Check for Updates',
+      'common.restartToUpdate': 'Restart to update',
+      'common.updateUnsupported': 'Download latest version...',
       'window.close': 'Close',
       'window.minimize': 'Minimize',
       'window.title': 'Window',
@@ -110,6 +113,8 @@ const createMockApp = () => {
     },
     updaterManager: {
       checkForUpdates: vi.fn(),
+      getUpdaterState: vi.fn(() => ({ stage: 'idle' })),
+      installNow: vi.fn(),
     },
     storeManager: {
       get: vi.fn(),
@@ -263,6 +268,37 @@ describe('LinuxMenu', () => {
       expect(checkUpdatesItem).toBeDefined();
       checkUpdatesItem.click();
       expect(mockApp.updaterManager.checkForUpdates).toHaveBeenCalledWith({ manual: true });
+    });
+
+    // Regression: the Linux menu used to hard-code "Check for Updates" and never
+    // read the updater stage, so a downloaded update could not be installed from
+    // the menu at all — unlike macOS and Windows. Issue #19564.
+    it('offers restart-to-update once an update is downloaded', () => {
+      mockApp.updaterManager.getUpdaterState = vi.fn(() => ({ stage: 'downloaded' })) as any;
+      linuxMenu.buildAndSetAppMenu();
+
+      const template = (Menu.buildFromTemplate as any).mock.calls.at(-1)[0];
+      const fileMenu = template.find((item: any) => item.label === 'File');
+      const item = fileMenu.submenu.find((entry: any) => entry.label === 'Restart to update');
+
+      expect(item).toBeDefined();
+      item.click();
+      expect(mockApp.updaterManager.installNow).toHaveBeenCalled();
+    });
+
+    it('sends the user to the download page when the install format cannot self-update', () => {
+      mockApp.updaterManager.getUpdaterState = vi.fn(() => ({ stage: 'unsupported' })) as any;
+      linuxMenu.buildAndSetAppMenu();
+
+      const template = (Menu.buildFromTemplate as any).mock.calls.at(-1)[0];
+      const fileMenu = template.find((item: any) => item.label === 'File');
+      const item = fileMenu.submenu.find(
+        (entry: any) => entry.label === 'Download latest version...',
+      );
+
+      expect(item).toBeDefined();
+      item.click();
+      expect(shell.openExternal).toHaveBeenCalledWith(DOWNLOAD_URL.default);
     });
 
     it('should handle visit website click', async () => {
@@ -467,6 +503,18 @@ describe('LinuxMenu', () => {
 
       expect(fullscreenItem.role).toBe('togglefullscreen');
     });
+
+    it('should bind F12 to the explicit DevTools handler', () => {
+      linuxMenu.buildAndSetAppMenu();
+
+      const template = (Menu.buildFromTemplate as any).mock.calls[0][0];
+      const viewMenu = template.find((item: any) => item.label === 'View');
+      const devToolsItem = viewMenu.submenu.find((item: any) => item.label === 'Developer Tools');
+
+      expect(devToolsItem.accelerator).toBe('F12');
+      expect(typeof devToolsItem.click).toBe('function');
+      expect(devToolsItem.role).toBeUndefined();
+    });
   });
 
   describe('developer menu items', () => {
@@ -492,14 +540,15 @@ describe('LinuxMenu', () => {
       expect(mockApp.browserManager.retrieveByIdentifier).toHaveBeenCalledWith('devtools');
     });
 
-    it('should use role for developer tools (accelerator handled by Electron)', () => {
+    it('should use explicit handler for developer tools', () => {
       linuxMenu.buildAndSetAppMenu({ showDevItems: true });
 
       const template = (Menu.buildFromTemplate as any).mock.calls[0][0];
       const devMenu = template.find((item: any) => item.label === 'Developer');
       const devToolsItem = devMenu.submenu.find((item: any) => item.label === 'Developer Tools');
 
-      expect(devToolsItem.role).toBe('toggleDevTools');
+      expect(typeof devToolsItem.click).toBe('function');
+      expect(devToolsItem.role).toBeUndefined();
     });
 
     it('should include reload options in developer menu', () => {

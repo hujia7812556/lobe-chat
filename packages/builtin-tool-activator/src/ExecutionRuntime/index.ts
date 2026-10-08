@@ -12,6 +12,12 @@ export interface ToolManifestInfo {
 
 export interface ActivatorRuntimeService {
   activateSkill?: (args: ActivateSkillParams) => Promise<BuiltinServerRuntimeOutput>;
+  /**
+   * Why an identifier that exists is withheld from this run, if the host knows.
+   * A bare "Not found" for a tool the model has seen before reads as a typo, so
+   * it retries instead of telling the user what they can change.
+   */
+  explainNotFound?: (identifier: string) => string | undefined;
   getActivatedToolIds: () => string[];
   getToolManifests: (identifiers: string[]) => Promise<ToolManifestInfo[]>;
   markActivated: (identifiers: string[]) => void;
@@ -105,19 +111,18 @@ export class ActivatorExecutionRuntime {
       const parts: string[] = [];
 
       if (activatedTools.length > 0) {
-        parts.push('Successfully activated tools:');
-        for (const manifest of manifests) {
-          parts.push(`\n## ${manifest.name} (${manifest.identifier})`);
-          if (manifest.systemRole) {
-            parts.push(manifest.systemRole);
-          }
-          if (manifest.apiDescriptions.length > 0) {
-            parts.push('\nAvailable APIs:');
-            for (const api of manifest.apiDescriptions) {
-              parts.push(`- **${api.name}**: ${api.description}`);
-            }
-          }
-        }
+        // Activation state flows through `state.activatedTools` and gets the
+        // manifest (systemRole + API schemas) injected into the system prompt
+        // from the next LLM call onwards, so the result only needs to list the
+        // newly callable APIs — returning the full docs here would double-carry
+        // them in every subsequent payload.
+        const apiNames = manifests.flatMap((manifest) =>
+          manifest.apiDescriptions.length > 0
+            ? manifest.apiDescriptions.map((api) => `${manifest.identifier}.${api.name}`)
+            : [manifest.identifier],
+        );
+        parts.push(`Successfully activated tools: ${apiNames.join(', ')}.`);
+        parts.push('Usage instructions for the activated items are in the system prompt.');
       }
 
       if (activatedSkillResults.length > 0) {
@@ -130,8 +135,15 @@ export class ActivatorExecutionRuntime {
         parts.push(`\nAlready active: ${alreadyActiveList.join(', ')}`);
       }
 
-      if (notFound.length > 0) {
-        parts.push(`\nNot found: ${notFound.join(', ')}`);
+      const unexplained: string[] = [];
+      for (const id of notFound) {
+        const explanation = this.service.explainNotFound?.(id);
+        if (explanation) parts.push(`\nNot available: ${id}. ${explanation}`);
+        else unexplained.push(id);
+      }
+
+      if (unexplained.length > 0) {
+        parts.push(`\nNot found: ${unexplained.join(', ')}`);
       }
 
       return {

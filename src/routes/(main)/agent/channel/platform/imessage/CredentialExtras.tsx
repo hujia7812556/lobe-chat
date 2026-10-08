@@ -2,14 +2,16 @@
 
 import { isDesktop } from '@lobechat/const';
 import type { ImessageBridgeConfig, ImessageBridgeStatus } from '@lobechat/electron-client-ipc';
-import { Flexbox, FormItem, Tag, Text } from '@lobehub/ui';
-import { App, Button, Form as AntdForm, Switch } from 'antd';
+import { Flexbox, Icon } from '@lobehub/ui';
+import { Button, Switch, Tag, Text, toast } from '@lobehub/ui/base-ui';
+import { Form, useFormInstance, useWatch } from '@lobehub/ui/base-ui/form';
 import { createStaticStyles } from 'antd-style';
-import { Info, Wrench } from 'lucide-react';
+import { KeyRound, Link2, Wrench } from 'lucide-react';
 import { memo, use, useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { FormInput, FormPassword } from '@/components/FormInput';
+import InfoTooltip from '@/components/InfoTooltip';
 import { useClientDataSWR } from '@/libs/swr';
 import { imessageKeys } from '@/libs/swr/keys';
 import { gatewayConnectionService } from '@/services/electron/gatewayConnection';
@@ -26,6 +28,10 @@ const styles = createStaticStyles(({ css, cssVar }) => ({
 
     background: ${cssVar.colorBgContainer};
   `,
+  fieldIcon: css`
+    flex: none;
+    color: ${cssVar.colorTextSecondary};
+  `,
   headerIcon: css`
     overflow: hidden;
     flex: none;
@@ -40,16 +46,6 @@ const styles = createStaticStyles(({ css, cssVar }) => ({
       height: 100%;
       object-fit: contain;
     }
-  `,
-  infoBox: css`
-    padding-block: 8px;
-    padding-inline: 12px;
-    border-radius: ${cssVar.borderRadius};
-
-    line-height: 1.6;
-    color: ${cssVar.colorTextSecondary};
-
-    background: ${cssVar.colorFillQuaternary};
   `,
   statusCard: css`
     padding: 12px;
@@ -72,9 +68,9 @@ const getErrorMessage = (error: unknown) =>
 const CredentialExtras = memo(() => {
   const { t: _t } = useTranslation('agent');
   const t = _t as (key: string) => string;
-  const { message } = App.useApp();
-  const form = AntdForm.useFormInstance();
-  const applicationId = AntdForm.useWatch('applicationId', form) as string | undefined;
+
+  const form = useFormInstance();
+  const applicationId = useWatch(form, 'applicationId') as string | undefined;
   const appId = applicationId?.trim();
   const postSave = use(ChannelPostSaveContext);
 
@@ -114,20 +110,18 @@ const CredentialExtras = memo(() => {
 
   const fillDesktopDeviceId = useCallback(async () => {
     const deviceInfo = await gatewayConnectionService.getDeviceInfo();
-    form.setFieldValue(['credentials', 'desktopDeviceId'], deviceInfo.deviceId);
-    void form.validateFields([['credentials', 'desktopDeviceId']]).catch(() => undefined);
+    form.setValue('credentials.desktopDeviceId', deviceInfo.deviceId);
+    void form.validate(['credentials.desktopDeviceId']);
   }, [form]);
 
   // The webhook secret is shared between the cloud provider and the local
   // bridge but is not a user-facing field — generate one on demand and reuse
   // whatever is already stored on the form (saved config or a prior generation).
   const ensureWebhookSecret = useCallback((): string => {
-    const existing = (
-      form.getFieldValue(['credentials', 'webhookSecret']) as string | undefined
-    )?.trim();
+    const existing = (form.getValue('credentials.webhookSecret') as string | undefined)?.trim();
     if (existing) return existing;
     const generated = globalThis.crypto.randomUUID();
-    form.setFieldValue(['credentials', 'webhookSecret'], generated);
+    form.setValue('credentials.webhookSecret', generated);
     return generated;
   }, [form]);
 
@@ -200,7 +194,7 @@ const CredentialExtras = memo(() => {
     try {
       await persistConfig(next);
     } catch (error) {
-      message.error(getErrorMessage(error));
+      toast.error(getErrorMessage(error));
     } finally {
       setOptimisticEnabled(null);
       setToggling(false);
@@ -217,10 +211,10 @@ const CredentialExtras = memo(() => {
       const config = buildBridgeConfig(enabled);
       await imessageBridgeService.testConfig(config);
       setTestStatus('success');
-      message.success(t('channel.imessage.bridgeTestSuccess'));
+      toast.success(t('channel.imessage.bridgeTestSuccess'));
     } catch (error) {
       setTestStatus('failed');
-      message.error(`${t('channel.imessage.bridgeTestFailed')}: ${getErrorMessage(error)}`);
+      toast.error(`${t('channel.imessage.bridgeTestFailed')}: ${getErrorMessage(error)}`);
     } finally {
       setTesting(false);
     }
@@ -259,36 +253,41 @@ const CredentialExtras = memo(() => {
       </Flexbox>
 
       {/* Middle: the credential fields the operator fills in. */}
-      <FormItem
-        desc={t('channel.imessage.blueBubblesServerUrlHint')}
-        label={t('channel.imessage.blueBubblesServerUrl')}
+      <Form.Field
+        avatar={<Icon className={styles.fieldIcon} icon={Link2} size={20} />}
         minWidth={'max(50%, 360px)'}
-        variant="borderless"
-      >
-        <Flexbox gap={8}>
-          <FormInput
-            placeholder="http://127.0.0.1:1234"
-            value={serverUrlInput}
-            onChange={(value) => {
-              setServerUrlInput(value);
-              setServerUrlDirty(true);
-              setTestStatus('idle');
-            }}
-          />
-          <Flexbox horizontal align="flex-start" className={styles.infoBox} gap={8}>
-            <Info size={14} style={{ flex: 'none', marginBlockStart: 3 }} />
-            <Text fontSize={12} type="secondary">
-              {t('channel.imessage.blueBubblesServerUrlTip')}
-            </Text>
+        variant="outlined"
+        label={
+          <Flexbox horizontal align="center" gap={8}>
+            {t('channel.imessage.blueBubblesServerUrl')}
+            <InfoTooltip
+              size={'small'}
+              title={`${t('channel.imessage.blueBubblesServerUrlHint')} ${t('channel.imessage.blueBubblesServerUrlTip')}`}
+            />
           </Flexbox>
-        </Flexbox>
-      </FormItem>
-      <FormItem
+        }
+      >
+        <FormInput
+          placeholder="http://127.0.0.1:1234"
+          value={serverUrlInput}
+          onChange={(value) => {
+            setServerUrlInput(value);
+            setServerUrlDirty(true);
+            setTestStatus('idle');
+          }}
+        />
+      </Form.Field>
+      <Form.Field
         divider
-        desc={t('channel.imessage.blueBubblesPasswordHint')}
-        label={t('channel.imessage.blueBubblesPassword')}
+        avatar={<Icon className={styles.fieldIcon} icon={KeyRound} size={20} />}
         minWidth={'max(50%, 360px)'}
-        variant="borderless"
+        variant="outlined"
+        label={
+          <Flexbox horizontal align="center" gap={8}>
+            {t('channel.imessage.blueBubblesPassword')}
+            <InfoTooltip size={'small'} title={t('channel.imessage.blueBubblesPasswordHint')} />
+          </Flexbox>
+        }
       >
         <FormPassword
           autoComplete="new-password"
@@ -299,7 +298,7 @@ const CredentialExtras = memo(() => {
             setTestStatus('idle');
           }}
         />
-      </FormItem>
+      </Form.Field>
 
       {/* Bottom: row 1 — service status + the Enable toggle (write-through);
           row 2 — the connection test. */}

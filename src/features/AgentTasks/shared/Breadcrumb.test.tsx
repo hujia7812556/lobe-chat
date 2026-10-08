@@ -15,29 +15,20 @@ const createState = (taskDetailMap: Record<string, any>) => ({
   taskDetailMap,
 });
 
-vi.mock('@lobehub/ui', () => ({
-  Icon: () => <span>icon</span>,
-  Text: ({ children }: { children: ReactNode }) => <span>{children}</span>,
-}));
-
-vi.mock('antd', () => ({
-  Breadcrumb: ({ items }: { items: Array<{ key?: string; title: ReactNode }> }) => (
-    <nav>
-      {items.map((item, index) => (
-        <span data-testid="crumb" key={item.key ?? index}>
-          {item.title}
-        </span>
-      ))}
-    </nav>
-  ),
-}));
-
-vi.mock('react-i18next', () => ({
-  useTranslation: () => ({ t: (key: string) => key }),
-}));
-
 vi.mock('react-router', () => ({
   Link: ({ children, to }: { children: ReactNode; to: string }) => <a href={to}>{children}</a>,
+  useParams: () => ({}),
+}));
+
+// Render the workspace-aware link as a plain anchor so the asserted hrefs stay
+// the raw task paths (no workspace-slug prefix, no real router context).
+vi.mock('@/features/Workspace/WorkspaceLink', () => ({
+  default: ({ children, to }: { children: ReactNode; to: string }) => <a href={to}>{children}</a>,
+}));
+
+// Agent crumb metadata isn't under test here; the agent store isn't mocked.
+vi.mock('./useAgentDisplayMeta', () => ({
+  useAgentDisplayMeta: () => undefined,
 }));
 
 vi.mock('zustand/react/shallow', () => ({
@@ -82,9 +73,12 @@ describe('Breadcrumb', () => {
 
     expect(screen.getByRole('link', { name: 'T-parent' })).toHaveAttribute(
       'href',
-      '/agent/agt_parent/task/T-parent',
+      '/agent/agt_parent/task/T-parent/parent-task',
     );
-    expect(screen.getByRole('link', { name: 'T-root' })).toHaveAttribute('href', '/task/T-root');
+    expect(screen.getByRole('link', { name: 'T-root' })).toHaveAttribute(
+      'href',
+      '/task/T-root/root-task',
+    );
   });
 
   it('falls back to the global route when an ancestor owner is unknown', () => {
@@ -102,7 +96,7 @@ describe('Breadcrumb', () => {
 
     expect(screen.getByRole('link', { name: 'T-parent' })).toHaveAttribute(
       'href',
-      '/task/T-parent',
+      '/task/T-parent/parent-task',
     );
   });
 });

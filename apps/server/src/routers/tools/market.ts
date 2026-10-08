@@ -3,22 +3,28 @@ import { TRPCError } from '@trpc/server';
 import debug from 'debug';
 import { z } from 'zod';
 
-import { wsCompatProcedure } from '@/business/server/trpc-middlewares/workspaceAuth';
+import {
+  requireWorkspaceRoleWhenScoped,
+  wsCompatProcedure,
+} from '@/business/server/trpc-middlewares/workspaceAuth';
 import { AgentSkillModel } from '@/database/models/agentSkill';
 import { FileModel } from '@/database/models/file';
+import { UserModel } from '@/database/models/user';
 import { type ToolCallContent } from '@/libs/mcp';
 import { authedProcedure, router } from '@/libs/trpc/lambda';
 import { marketUserInfo, serverDatabase, telemetry } from '@/libs/trpc/lambda/middleware';
 import { marketSDK, requireMarketAuth } from '@/libs/trpc/lambda/middleware/marketSDK';
-import { isTrustedClientEnabled } from '@/libs/trusted-client';
+import { isTrustedClientEnabled, type TrustedClientUserInfo } from '@/libs/trusted-client';
 import { DiscoverService } from '@/server/services/discover';
 import { FileService } from '@/server/services/file';
 import { MarketService } from '@/server/services/market';
+import { listSkillToolsWithLiveFallback } from '@/server/services/market/listSkillToolsWithLiveFallback';
 import {
   contentBlocksToString,
   processContentBlocks,
 } from '@/server/services/mcp/contentProcessor';
-import { createSandboxService } from '@/server/services/sandbox';
+import { createSandboxService, resolveSandboxSessionConfig } from '@/server/services/sandbox';
+import { preprocessLhCommand } from '@/server/services/toolExecution/preprocessLhCommand';
 
 import { scheduleToolCallReport } from './_helpers';
 import {
@@ -56,7 +62,6 @@ const marketToolProcedure = wsCompatProcedure
   .use(telemetry)
   .use(marketUserInfo)
   .use(async ({ ctx, next }) => {
-    const { UserModel } = await import('@/database/models/user');
     const userModel = new UserModel(ctx.serverDB, ctx.userId);
 
     // In a workspace context, sandbox runtime calls are attributed to the
@@ -79,6 +84,11 @@ const marketToolProcedure = wsCompatProcedure
       },
     });
   });
+
+// Execution mutations (sandbox runs, cloud MCP calls, file exports) have side
+// effects and spend quota — workspace viewers (read-only) are gated out while
+// personal mode passes through unrestricted.
+const marketToolWriteProcedure = marketToolProcedure.use(requireWorkspaceRoleWhenScoped('member'));
 
 // ============================== LobeHub Skill Procedures ==============================
 /**
@@ -117,10 +127,23 @@ const metaSchema = z
 
 // Schema for sandbox tool execution request
 const execInSandboxSchema = z.object({
-  params: z.record(z.any()),
+  params: z.record(z.string(), z.any()),
   toolName: z.string(),
   topicId: z.string(),
-  userId: z.string().optional(), // Optional: fallback to ctx.userId if not provided
+  /**
+   * SECURITY: accepted for backward compatibility with older clients (the SPA
+   * and desktop still send it, see `src/services/cloudSandbox.ts`) but
+   * ALWAYS IGNORED by the handler — the effective identity is `ctx.userId`.
+   *
+   * It used to override `ctx.userId`, which let any authenticated caller mint
+   * and read another user's JWT: `preprocessLhCommand` signs a user JWT and
+   * inlines it into the shell command run inside a sandbox the caller fully
+   * controls (`declare -f lh` prints the injected token back). The same forged
+   * id also selected the AgentSkill/File rows and the sandbox session.
+   *
+   * @deprecated Ignored by the server; will be dropped once no client sends it.
+   */
+  userId: z.string().optional(),
 });
 
 // Schema for export and upload file (combined operation)
@@ -132,7 +155,7 @@ const exportAndUploadFileSchema = z.object({
 
 // Schema for cloud MCP endpoint call
 const callCloudMcpEndpointSchema = z.object({
-  apiParams: z.record(z.any()),
+  apiParams: z.record(z.string(), z.any()),
   identifier: z.string(),
   meta: metaSchema,
   toolName: z.string(),
@@ -173,7 +196,9 @@ const execInSandboxHandler = async ({
 }: {
   ctx: {
     fileService: FileService;
+    marketAccessToken?: string;
     marketService: MarketService;
+    marketUserInfo?: TrustedClientUserInfo;
     serverDB: any;
     userId: string;
     workspaceId?: string | null;
@@ -181,7 +206,19 @@ const execInSandboxHandler = async ({
   input: ExecInSandboxInput;
 }): Promise<CallToolResult> => {
   const { toolName, params, topicId } = input;
-  const userId = input?.userId || ctx.userId;
+  // SECURITY: never trust `input.userId` — see the JSDoc on `execInSandboxSchema`.
+  // Everything downstream (JWT minting, skill/file lookups, sandbox session
+  // isolation) is keyed off this id, so it must come from the authenticated
+  // context only.
+  const userId = ctx.userId;
+
+  if (input?.userId && input.userId !== ctx.userId) {
+    log(
+      'execInSandbox: ignored deprecated input.userId=%s (differs from ctx.userId=%s)',
+      input.userId,
+      ctx.userId,
+    );
+  }
 
   log('execInSandbox: tool=%s, topicId=%s', toolName, topicId);
 
@@ -189,10 +226,18 @@ const execInSandboxHandler = async ({
     let enhancedParams = params;
 
     // Preprocess lh commands: rewrite to npx @lobehub/cli + inject auth env vars
+    //
+    // The minted credential is always scoped to `ctx.userId`, i.e. the caller
+    // themselves. This route is an `authedProcedure` invoked directly by a
+    // client, so it carries no `agentShareVisitor` context; a visitor reaching
+    // it can therefore only ever act as (and spend as) their own account, which
+    // is why no `shareVisitorBlocked` guard is applied here.
     if ((toolName === 'execScript' || toolName === 'runCommand') && params.command) {
-      const { preprocessLhCommand } =
-        await import('@/server/services/toolExecution/preprocessLhCommand');
-      const lhResult = await preprocessLhCommand(params.command, userId);
+      const lhResult = await preprocessLhCommand(
+        params.command,
+        userId,
+        ctx.workspaceId ?? undefined,
+      );
 
       if (lhResult.error) {
         return {
@@ -243,9 +288,40 @@ const execInSandboxHandler = async ({
       }
     }
 
+    // The persistent workspace, resolved the same way the server runtimes do.
+    // This route is the client-side executor's way into the sandbox — the one a
+    // conversation uses when its tool calls are not dispatched server-side —
+    // and it used to open a session with no mode, no directory and no claim.
+    // Every run through here was therefore ephemeral: the composer showed the
+    // instance the topic had chosen while `pwd` answered `/workspace`, and
+    // whatever the run wrote went nowhere the file browser reads.
+    const sandbox = await resolveSandboxSessionConfig({
+      // Direct client call, so the caller is always acting as themselves.
+      isShareVisitorRun: false,
+      serverDB: ctx.serverDB,
+      topicId,
+      userId,
+      workspaceId: ctx.workspaceId ?? undefined,
+    });
+
+    // The claim has to ride on the identity this call is signed with, not just
+    // on the request: the execution plane reads the entitlement off the trusted
+    // client token, and `ctx.marketService` was built before it was known.
+    const marketService = sandbox.claim
+      ? new MarketService({
+          accessToken: ctx.marketAccessToken,
+          userInfo: { ...ctx.marketUserInfo, sandboxStorage: sandbox.claim, userId: ctx.userId },
+        })
+      : ctx.marketService;
+
     const sandboxService = createSandboxService({
       fileService: ctx.fileService,
-      marketService: ctx.marketService,
+      marketService,
+      sandboxCwd: sandbox.cwd,
+      sandboxInstanceId: sandbox.environment,
+      sandboxMode: sandbox.mode,
+      sandboxSpecification: sandbox.specification,
+      sandboxWorkingDir: sandbox.workingDir,
       serverDB: ctx.serverDB,
       topicId,
       userId,
@@ -297,7 +373,7 @@ const execInSandboxHandler = async ({
 // ============================== Router ==============================
 export const marketRouter = router({
   // ============================== Cloud MCP Gateway ==============================
-  callCloudMcpEndpoint: marketToolProcedure
+  callCloudMcpEndpoint: marketToolWriteProcedure
     .input(callCloudMcpEndpointSchema)
     .mutation(async ({ input, ctx }) => {
       log('callCloudMcpEndpoint input: %O', input);
@@ -388,12 +464,12 @@ export const marketRouter = router({
     }),
 
   /** @deprecated Use execInSandbox instead. Will be removed in a future version. */
-  callCodeInterpreterTool: marketToolProcedure
+  callCodeInterpreterTool: marketToolWriteProcedure
     .input(execInSandboxSchema)
     .mutation(({ input, ctx }) => execInSandboxHandler({ ctx, input })),
 
   // ============================== Sandbox Execution ==============================
-  execInSandbox: marketToolProcedure
+  execInSandbox: marketToolWriteProcedure
     .input(execInSandboxSchema)
     .mutation(({ input, ctx }) => execInSandboxHandler({ ctx, input })),
 
@@ -404,7 +480,7 @@ export const marketRouter = router({
   connectCallTool: lobehubSkillAuthProcedure
     .input(
       z.object({
-        args: z.record(z.any()).optional(),
+        args: z.record(z.string(), z.any()).optional(),
         provider: z.string(),
         toolName: z.string(),
         topicId: z.string().optional(),
@@ -425,6 +501,7 @@ export const marketRouter = router({
 
         return {
           data: response.data,
+          error: (response as any).error,
           success: response.success,
         };
       } catch (error) {
@@ -594,7 +671,17 @@ export const marketRouter = router({
       log('connectListTools: provider=%s', input.provider);
 
       try {
-        const response = await ctx.marketSDK.skills.listTools(input.provider);
+        const response = await listSkillToolsWithLiveFallback(
+          ctx.marketSDK.skills,
+          input.provider,
+          (error) => {
+            log(
+              'listSkillToolsWithLiveFallback: live discovery failed for %s, falling back to static tools: %O',
+              input.provider,
+              error,
+            );
+          },
+        );
         return {
           provider: input.provider,
           tools: response.tools || [],
@@ -656,7 +743,7 @@ export const marketRouter = router({
    * This combines the previous getExportFileUploadUrl + execInSandbox + createFileRecord flow
    * Returns a permanent /f/:id URL instead of a temporary pre-signed URL
    */
-  exportAndUploadFile: marketToolProcedure
+  exportAndUploadFile: marketToolWriteProcedure
     .input(exportAndUploadFileSchema)
     .mutation(async ({ input, ctx }) => {
       const { path, filename, topicId } = input;

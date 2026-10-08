@@ -6,7 +6,9 @@ import {
   type ToolManifestInfo,
 } from '@lobechat/builtin-tool-activator/executionRuntime';
 import { SkillsExecutionRuntime } from '@lobechat/builtin-tool-skills/executionRuntime';
+import { describeLockedDevicePicker, getDisabledPluginIds } from '@lobechat/types';
 
+import { AgentModel } from '@/database/models/agent';
 import { AgentSkillModel } from '@/database/models/agentSkill';
 import { filterBuiltinSkills } from '@/helpers/skillFilters';
 import {
@@ -15,6 +17,7 @@ import {
 } from '@/server/services/agentSignal/procedure';
 import { redisPolicyStateStore } from '@/server/services/agentSignal/store/adapters/redis/policyStateStore';
 
+import { REMOTE_DEVICE_TOOL_IDENTIFIER } from './noActiveDevice';
 import { type ServerRuntimeRegistration } from './types';
 
 /**
@@ -68,12 +71,38 @@ export const activatorRuntime: ServerRuntimeRegistration = {
     let skillsRuntime: SkillsExecutionRuntime | undefined;
     if (context.serverDB && context.userId) {
       const skillModel = new AgentSkillModel(context.serverDB, context.userId, context.workspaceId);
+
+      // `activateSkill` resolves independently of `operationSkillSet`/
+      // `<available_skills>` (built once, earlier, in aiAgent/index.ts) — it
+      // queries builtins/DB directly by name. Without this guard, a skill
+      // the agent has explicitly disabled would no longer be *listed*, but a
+      // model that already knows its name (prior turn, or a guess) could
+      // still activate and use it. Re-derive the disabled set here so this
+      // independent resolution path enforces the same tri-state.
+      let disabledSkillIds = new Set<string>();
+      if (context.agentId) {
+        const agentModel = new AgentModel(context.serverDB, context.userId, context.workspaceId);
+        const agentConfig = await agentModel.getAgentConfigById(context.agentId);
+        disabledSkillIds = new Set(getDisabledPluginIds(agentConfig?.plugins ?? undefined));
+      }
+
       skillsRuntime = new SkillsExecutionRuntime({
-        builtinSkills: filterBuiltinSkills(builtinSkills),
+        // Same device gate as the skills runtime: device-only skills are
+        // activatable in device-capable runs (matching <available_skills>),
+        // with `activeDeviceId` as the fallback for callers without a plan.
+        builtinSkills: filterBuiltinSkills(builtinSkills, {
+          canExecuteOnDevice: context.deviceCapable ?? !!context.activeDeviceId,
+        }).filter((skill) => !disabledSkillIds.has(skill.identifier)),
         service: {
           findAll: () => skillModel.findAll(),
-          findById: (id) => skillModel.findById(id),
-          findByName: (name) => skillModel.findByName(name),
+          findById: async (id) => {
+            const skill = await skillModel.findById(id);
+            return skill && disabledSkillIds.has(skill.identifier) ? undefined : skill;
+          },
+          findByName: async (name) => {
+            const skill = await skillModel.findByName(name);
+            return skill && disabledSkillIds.has(skill.identifier) ? undefined : skill;
+          },
           readResource: async () => {
             throw new Error('readResource not available in tools runtime');
           },
@@ -103,6 +132,12 @@ export const activatorRuntime: ServerRuntimeRegistration = {
             }
           }
         : undefined,
+      // A device-locked run walls the picker off, so activating it can only fail;
+      // say why, so the model sends the user to the device selector instead.
+      explainNotFound: (identifier) =>
+        identifier === REMOTE_DEVICE_TOOL_IDENTIFIER && context.executionPlan
+          ? describeLockedDevicePicker(context.executionPlan)
+          : undefined,
       getActivatedToolIds: () => [...activatedIds],
       getToolManifests: async (identifiers: string[]): Promise<ToolManifestInfo[]> => {
         // Note: context.toolManifestMap should only contain discoverable tools.

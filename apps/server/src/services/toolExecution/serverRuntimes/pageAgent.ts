@@ -4,13 +4,14 @@ import {
   type PageAgentInvocationContext,
   type PageAgentRuntimeService,
 } from '@lobechat/builtin-tool-page-agent/executionRuntime';
-import { EditorRuntime } from '@lobechat/editor-runtime';
-import { createHeadlessEditor, type HeadlessEditor } from '@lobehub/editor/headless';
+import { EditorRuntime, formatModifyNodesResult } from '@lobechat/editor-runtime';
+import { type HeadlessEditor } from '@lobehub/editor/headless';
 import type { SerializedEditorState, SerializedLexicalNode } from 'lexical';
 
 import { DocumentModel } from '@/database/models/document';
 import { type LobeChatDatabase } from '@/database/type';
 import { isValidEditorData } from '@/libs/editor/isValidEditorData';
+import { createDocumentHeadlessEditor } from '@/server/services/agentDocuments/headlessEditor';
 import { DocumentService } from '@/server/services/document';
 
 import type { ServerRuntimeRegistration } from './types';
@@ -127,7 +128,7 @@ const loadSnapshot = async (
 };
 
 const buildEnv = (snapshot: DocumentSnapshot, documentId: string): InvocationEnv => {
-  const headless = createHeadlessEditor();
+  const headless = createDocumentHeadlessEditor();
   let title = snapshot.title;
 
   if (isValidEditorData(snapshot.editorData)) {
@@ -204,7 +205,7 @@ const withEditor = async (
   // workspace members and rejected (CONFLICT) when someone else is actively
   // editing, instead of silently clobbering their work. Read-only invocations
   // (persist: false) never write, so they skip the lock.
-  const run = async (): Promise<HandlerOutput> => {
+  const run = async (lockOwnerId?: string): Promise<HandlerOutput> => {
     const snapshot = await loadSnapshot(documentModel, documentId);
     const env = buildEnv(snapshot, documentId);
 
@@ -254,6 +255,7 @@ const withEditor = async (
         await documentService.updateDocument(documentId, {
           content: patch.content,
           editorData: patch.editorData,
+          ...(lockOwnerId ? { lockOwnerId } : {}),
           saveSource: 'llm_call',
           title: patch.title,
         });
@@ -344,21 +346,8 @@ const buildService = (
     modifyNodes: (args, ctx) =>
       withEditor(serviceCtx, 'modifyNodes', ctx, async ({ runtime }) => {
         const result = await runtime.modifyNodes(args);
-        const operations = Array.isArray(args.operations)
-          ? args.operations
-          : args.operations
-            ? [args.operations]
-            : [];
-        const actionSummary = operations.reduce<Record<string, number>>((acc, op) => {
-          if (!op) return acc;
-          acc[op.action] = (acc[op.action] || 0) + 1;
-          return acc;
-        }, {});
-        const summary = Object.entries(actionSummary)
-          .map(([action, count]) => `${count} ${action}${count > 1 ? 's' : ''}`)
-          .join(', ');
         return {
-          content: `Successfully executed ${summary} (${result.successCount}/${result.totalCount} operations succeeded).`,
+          content: formatModifyNodesResult(result),
           state: {
             results: result.results,
             successCount: result.successCount,

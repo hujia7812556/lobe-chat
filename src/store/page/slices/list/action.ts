@@ -1,4 +1,4 @@
-import { CUSTOM_DOCUMENT_FILE_TYPE } from '@lobechat/const';
+import { PAGE_DOCUMENT_FILE_TYPES, PAGE_DOCUMENT_SOURCE_TYPES } from '@lobechat/const';
 import { type DocumentItem } from '@lobechat/database/schemas';
 import { type SWRResponse } from 'swr';
 
@@ -30,13 +30,18 @@ const documentItemToLobeDocument = (document: DocumentItem): LobeDocument => ({
   totalLineCount: 0,
   updatedAt: document.updatedAt ? new Date(document.updatedAt) : new Date(),
   userId: document.userId,
+  visibility: document.visibility ?? null,
   workspaceId: document.workspaceId ?? null,
 });
 
 const n = setNamespace('page/list');
 
-const ALLOWED_PAGE_SOURCE_TYPES = new Set(['editor', 'file', 'api']);
-const ALLOWED_PAGE_FILE_TYPES = new Set([CUSTOM_DOCUMENT_FILE_TYPE, 'application/pdf']);
+// EDITOR is a client-only stamp on in-memory drafts; DB rows never carry it.
+const ALLOWED_PAGE_SOURCE_TYPES = new Set([
+  DocumentSourceType.EDITOR as string,
+  ...PAGE_DOCUMENT_SOURCE_TYPES,
+]);
+const ALLOWED_PAGE_FILE_TYPES = new Set(PAGE_DOCUMENT_FILE_TYPES);
 
 /**
  * Check if a page should be displayed in the page list
@@ -136,6 +141,32 @@ export class ListActionImpl {
 
   refreshDocuments = async (): Promise<void> => {
     await this.#get().fetchDocuments();
+  };
+
+  /**
+   * Publish a private page (and its whole subtree) to the workspace, then
+   * refetch the sidebar so the item hops from the "Private" accordion into
+   * "Workspace" immediately. Errors bubble up so the caller can surface a
+   * localized toast without swallowing the reason.
+   */
+  publishPageToWorkspace = async (pageId: string): Promise<{ documentIds: string[] }> => {
+    const result = await documentService.publishDocumentToWorkspace(pageId);
+    await this.#get().refreshDocuments();
+    return result;
+  };
+
+  /**
+   * Flip a page (and its whole subtree)'s workspace visibility. Bidirectional
+   * companion to `publishPageToWorkspace`. Refreshes the sidebar so the row
+   * hops between the "Private" and "Workspace" accordions.
+   */
+  setPageVisibility = async (
+    pageId: string,
+    visibility: 'private' | 'public',
+  ): Promise<{ documentIds: string[] }> => {
+    const result = await documentService.setDocumentVisibility(pageId, visibility);
+    await this.#get().refreshDocuments();
+    return result;
   };
 
   setSearchKeywords = (keywords: string): void => {

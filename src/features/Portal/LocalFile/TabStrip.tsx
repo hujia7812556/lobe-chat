@@ -131,7 +131,9 @@ const styles = createStaticStyles(({ css, cssVar }) => ({
 const SCROLL_AREA_STYLE = {
   background: 'transparent',
   borderRadius: 0,
-  flex: 1,
+  // Hug the tabs so the portal header's `…` sits right after the last one;
+  // still shrinks (and scrolls) once the tabs outgrow the header.
+  flex: '0 1 auto',
   minWidth: 0,
 };
 
@@ -207,7 +209,10 @@ const TabStrip = memo(() => {
         label: t('workingPanel.localFile.closeOther'),
         onClick: () => closeOtherLocalFileTabs(id),
       },
-      ...(isDesktop
+      // Sandbox-backed tabs point at paths inside the cloud sandbox — a local
+      // "show in system" would open an unrelated folder or fail.
+      ...(isDesktop &&
+      !openLocalFiles.find((file) => getLocalFileTabId(file) === id)?.sandboxTopicId
         ? [
             {
               key: 'showInSystem',

@@ -1,6 +1,6 @@
-import { Center, Flexbox, Icon } from '@lobehub/ui';
+import { Center, Flexbox } from '@lobehub/ui';
+import { Spin } from '@lobehub/ui/base-ui';
 import { createStaticStyles, cx } from 'antd-style';
-import { Loader2 } from 'lucide-react';
 import { memo, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 
@@ -112,11 +112,11 @@ const Render = memo<ArtifactProps>(({ identifier, title, type, language, childre
           )}
           {hasChildren && (
             <Flexbox horizontal className={styles.desc}>
-              {identifier} ·{' '}
+              {identifier} ·&nbsp;
               <Flexbox horizontal gap={2}>
                 {!isArtifactTagClosed && (
                   <div>
-                    <Icon spin icon={Loader2} />
+                    <Spin size="small" />
                   </div>
                 )}
                 {str?.length}

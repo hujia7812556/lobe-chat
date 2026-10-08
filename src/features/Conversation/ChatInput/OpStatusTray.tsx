@@ -175,6 +175,10 @@ const styles = createStaticStyles(({ css, cssVar }) => ({
     transform-box: fill-box;
     fill: ${cssVar.colorPrimary};
     animation: op-status-tray-glyph-core 1.5s ease-in-out infinite;
+
+    @media (prefers-reduced-motion: reduce) {
+      animation: none;
+    }
   `,
   glyphOrbit: css`
     transform-origin: center;
@@ -187,17 +191,19 @@ const styles = createStaticStyles(({ css, cssVar }) => ({
     stroke-width: 1.5;
 
     animation: op-status-tray-glyph-spin 2s linear infinite;
+
+    @media (prefers-reduced-motion: reduce) {
+      animation: none;
+    }
   `,
 }));
 
-const ActivityGlyph = memo(() => (
+const ActivityGlyph = () => (
   <svg aria-hidden className={styles.activityGlyph} viewBox="0 0 16 16">
     <circle className={styles.glyphOrbit} cx="8" cy="8" r="6.1" />
     <circle className={styles.glyphCore} cx="8" cy="8" r="2.7" />
   </svg>
-));
-
-ActivityGlyph.displayName = 'ActivityGlyph';
+);
 
 const formatTokens = (n: number) => {
   if (n < 1000) return String(n);
@@ -250,7 +256,8 @@ const OpStatusTray = memo<OpStatusTrayProps>(({ seamless, topAttached }) => {
     const runtimeOperationIds: string[] = [];
 
     for (const op of ops) {
-      if (op.status !== 'running' || op.metadata.isAborting) continue;
+      if (op.status !== 'running' || op.metadata.isAborting || op.metadata.visibleLoadingDone)
+        continue;
 
       const mapped = resolveOperationActivity(op.type);
       if (mapped && op.metadata.startTime > latestActivityStart) {
@@ -258,15 +265,17 @@ const OpStatusTray = memo<OpStatusTrayProps>(({ seamless, topAttached }) => {
         activity = mapped;
       }
 
-      if (!AI_RUNTIME_OPERATION_TYPES.includes(op.type)) {
+      const isSteeredSend = op.type === 'sendMessage' && op.metadata.turnStartTime !== undefined;
+      if (!AI_RUNTIME_OPERATION_TYPES.includes(op.type) && !isSteeredSend) {
         continue;
       }
 
       runtimeOperationIds.push(op.id);
       stepCount = Math.max(stepCount, normalizeStepCount(op.metadata.stepCount));
 
-      if (earliestStart === undefined || op.metadata.startTime < earliestStart) {
-        earliestStart = op.metadata.startTime;
+      const turnStartTime = op.metadata.turnStartTime ?? op.metadata.startTime;
+      if (earliestStart === undefined || turnStartTime < earliestStart) {
+        earliestStart = turnStartTime;
         statusSeed = op.id;
       }
     }
@@ -279,14 +288,20 @@ const OpStatusTray = memo<OpStatusTrayProps>(({ seamless, topAttached }) => {
     };
   });
   const operationsByMessage = useChatStore((s) => s.operationsByMessage);
+  const handoffStartTime = useChatStore((s) =>
+    operationSelectors.isSteerHandoffPending(context)(s)
+      ? operationSelectors.getLatestAgentRuntimeTurnStartTime(context)(s)
+      : undefined,
+  );
+  const startTime = operationState.startTime ?? handoffStartTime;
 
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
-    if (!operationState.startTime) return;
+    if (!startTime) return;
     setNow(Date.now());
     const id = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(id);
-  }, [operationState.startTime]);
+  }, [startTime]);
 
   const operationIds = useMemo(
     () => new Set(operationState.operationIdsKey.split('|').filter(Boolean)),
@@ -300,10 +315,10 @@ const OpStatusTray = memo<OpStatusTrayProps>(({ seamless, topAttached }) => {
     return calculateOperationUsageMetrics(dbMessages, operationIds, operationsByMessage);
   }, [dbMessages, operationIds, operationsByMessage]);
 
-  if (!operationState.startTime) return null;
+  if (!startTime) return null;
 
   const { totalCost, totalTokens } = usageMetrics;
-  const elapsed = now - operationState.startTime;
+  const elapsed = now - startTime;
   const costLabel = t('chat:opStatusTray.cost');
   const stepLabel = t('chat:opStatusTray.steps');
   const tokenLabel = t('chat:opStatusTray.tokens', { defaultValue: 'tokens' });
@@ -317,7 +332,7 @@ const OpStatusTray = memo<OpStatusTrayProps>(({ seamless, topAttached }) => {
   const randomGeneratingStatus =
     pickRotatingStatusPhrase(
       generatingPhrases,
-      operationState.statusSeed ?? String(operationState.startTime),
+      operationState.statusSeed ?? String(startTime),
       rotationStep,
     ) ?? t('chat:opStatusTray.status.generating');
   const statusText =

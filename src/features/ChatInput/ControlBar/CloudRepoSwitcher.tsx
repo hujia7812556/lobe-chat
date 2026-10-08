@@ -96,8 +96,6 @@ const styles = createStaticStyles(({ css }) => ({
     font-size: 11px;
     font-weight: 500;
     color: ${cssVar.colorTextQuaternary};
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
   `,
 }));
 
@@ -157,9 +155,14 @@ const CloudRepoSwitcher = memo<CloudRepoSwitcherProps>(({ agentId }) => {
 
       // Only set workingDirectory when it hasn't been assigned yet (first selection).
       // Once set, it stays fixed so the topic keeps its sidebar grouping.
-      const patch: { repos: string[]; workingDirectory?: string } = { repos: nextRepos };
+      const patch: {
+        repos: string[];
+        workingDirectory?: string;
+        workingDirectoryConfig?: { path: string; repoType: 'github' };
+      } = { repos: nextRepos };
       if (!currentWorkingDirectory && nextRepos.length > 0) {
         patch.workingDirectory = nextRepos[0];
+        patch.workingDirectoryConfig = { path: nextRepos[0], repoType: 'github' };
       }
 
       await updateTopicMetadata(activeTopicId, patch);

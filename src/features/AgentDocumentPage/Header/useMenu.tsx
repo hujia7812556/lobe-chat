@@ -3,15 +3,14 @@ import { isDesktop } from '@lobechat/const';
 import { useEditor } from '@lobehub/editor/react';
 import { Icon } from '@lobehub/ui';
 import type { DropdownItem } from '@lobehub/ui/base-ui';
-import { confirmModal } from '@lobehub/ui/base-ui';
-import { App } from 'antd';
+import { confirmModal, toast } from '@lobehub/ui/base-ui';
 import { cssVar, useResponsive } from 'antd-style';
-import dayjs from 'dayjs';
 import { Download, Link2, Maximize2, Trash2 } from 'lucide-react';
 import { useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { useActiveWorkspaceSlug } from '@/business/client/hooks/useActiveWorkspaceSlug';
+import { formatPageEditorInfoTime } from '@/features/PageEditor/formatPageEditorInfoTime';
 import { useAppOrigin } from '@/hooks/useAppOrigin';
 import { agentDocumentService } from '@/services/agentDocument';
 import { useGlobalStore } from '@/store/global';
@@ -21,6 +20,7 @@ interface UseMenuParams {
   agentDocumentId?: string;
   agentId: string;
   documentId: string;
+  fileBacked?: boolean;
   onDeleted: () => void;
   title?: string;
   updatedAt?: Date | string | null;
@@ -35,16 +35,18 @@ export const useMenu = ({
   agentDocumentId,
   agentId,
   documentId,
+  fileBacked,
   onDeleted,
   title,
   updatedAt,
 }: UseMenuParams): { menuItems: DropdownItem[] } => {
-  const { t } = useTranslation(['file', 'common', 'chat']);
-  const { message } = App.useApp();
+  const { i18n, t } = useTranslation(['file', 'common', 'chat']);
+
   const { lg = true } = useResponsive();
   const editor = useEditor();
   const appOrigin = useAppOrigin();
   const activeWorkspaceSlug = useActiveWorkspaceSlug();
+  const dateLocale = i18n.resolvedLanguage || i18n.language;
 
   const [wideScreen, toggleWideScreen] = useGlobalStore((s) => [
     systemStatusSelectors.wideScreen(s),
@@ -58,7 +60,7 @@ export const useMenu = ({
       });
       if (!url) return;
       await navigator.clipboard.writeText(url);
-      message.success(t('agentDocument.linkCopied', { ns: 'chat' }));
+      toast.success(t('agentDocument.linkCopied', { ns: 'chat' }));
     };
 
     const handleExportMarkdown = async () => {
@@ -79,10 +81,10 @@ export const useMenu = ({
           a.click();
           a.remove();
           URL.revokeObjectURL(url);
-          message.success(t('pageEditor.exportSuccess'));
+          toast.success(t('pageEditor.exportSuccess'));
         }
       } catch {
-        message.error(t('pageEditor.exportError'));
+        toast.error(t('pageEditor.exportError'));
       }
     };
 
@@ -96,10 +98,10 @@ export const useMenu = ({
         onOk: async () => {
           try {
             await agentDocumentService.removeDocument({ agentId, documentId, id: agentDocumentId });
-            message.success(t('workingPanel.resources.deleteSuccess', { ns: 'chat' }));
+            toast.success(t('workingPanel.resources.deleteSuccess', { ns: 'chat' }));
             onDeleted();
           } catch (error) {
-            message.error(
+            toast.error(
               error instanceof Error
                 ? error.message
                 : t('workingPanel.resources.deleteError', { ns: 'chat' }),
@@ -161,7 +163,7 @@ export const useMenu = ({
           label: (
             <span style={{ color: cssVar.colorTextTertiary, fontSize: 12, lineHeight: 1.6 }}>
               {t('pageEditor.editedAt', {
-                time: dayjs(updatedAt).format('MMMM D, YYYY [at] h:mm A'),
+                time: formatPageEditorInfoTime(updatedAt, dateLocale),
               })}
             </span>
           ),
@@ -169,7 +171,9 @@ export const useMenu = ({
       );
     }
 
-    return items;
+    return fileBacked
+      ? items.filter((item) => item?.key !== 'export' && item?.key !== 'full-width')
+      : items;
   }, [
     activeWorkspaceSlug,
     agentDocumentId,
@@ -177,8 +181,9 @@ export const useMenu = ({
     appOrigin,
     documentId,
     editor,
+    fileBacked,
     lg,
-    message,
+    dateLocale,
     onDeleted,
     t,
     title,

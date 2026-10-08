@@ -1,10 +1,13 @@
 // @vitest-environment node
 import { AGENT_DOCUMENT_FILE_TYPE } from '@lobechat/const';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { FileSource } from '@lobechat/types';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { AgentAccess, AgentDocumentModel } from '@/database/models/agentDocuments';
 import type { LobeChatDatabase } from '@/database/type';
 
+import * as headlessEditor from '../agentDocuments/headlessEditor';
+import { FileService } from '../file';
 import { AgentDocumentVfsService } from './index';
 import { createSkillMount } from './mounts/skills/createSkillMount';
 
@@ -17,11 +20,20 @@ vi.mock('@/database/models/agentDocuments', () => ({
     WRITE: 4,
   },
   AgentDocumentModel: vi.fn(),
-  buildDocumentFilename: vi.fn((title: string) => title),
+  buildDocumentFilename: vi.fn(function (title: string) {
+    return title;
+  }),
 }));
 
 vi.mock('./mounts/skills/createSkillMount', () => ({
   createSkillMount: vi.fn(),
+}));
+
+const removeUnreferencedFile = vi.hoisted(() => vi.fn());
+vi.mock('../file', () => ({
+  FileService: vi.fn(function () {
+    return { removeUnreferencedFile };
+  }),
 }));
 
 describe('AgentDocumentVfsService', () => {
@@ -49,20 +61,36 @@ describe('AgentDocumentVfsService', () => {
   };
 
   beforeEach(() => {
+    vi.mocked(FileService).mockClear();
+    removeUnreferencedFile.mockReset().mockResolvedValue(undefined);
     for (const method of Object.values(mockAgentDocumentModel)) {
       method.mockReset();
     }
+    mockAgentDocumentModel.permanentlyDelete.mockResolvedValue([]);
     for (const method of Object.values(mockSkillMount)) {
       method.mockReset();
     }
-    (AgentDocumentModel as unknown as ReturnType<typeof vi.fn>).mockImplementation(
-      () => mockAgentDocumentModel,
-    );
+    (AgentDocumentModel as unknown as ReturnType<typeof vi.fn>).mockImplementation(function () {
+      return mockAgentDocumentModel;
+    });
     (createSkillMount as unknown as ReturnType<typeof vi.fn>).mockReturnValue(mockSkillMount);
     mockAgentDocumentModel.listByParentAndFilename.mockImplementation(async (...args) => {
       const result = await mockAgentDocumentModel.findByParentAndFilename(...args);
       return result ? [result] : [];
     });
+  });
+
+  /** @example Native VFS browsing remains available without object storage. */
+  it('does not initialize storage when listing native documents', async () => {
+    mockAgentDocumentModel.listByParent.mockResolvedValue([]);
+    const service = new AgentDocumentVfsService(db, userId);
+    await service.list('./', { agentId: 'agent-1' });
+    /** @example Browsing a document tree has no storage configuration prerequisite. */
+    expect(FileService).not.toHaveBeenCalled();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
   it('lists ordinary root nodes plus the synthetic lobe directory', async () => {
@@ -287,6 +315,81 @@ describe('AgentDocumentVfsService', () => {
         type: 'file',
       }),
     );
+  });
+
+  it('stores raw ordinary file content without Markdown serialization', async () => {
+    const content = `<knowledge_base_files totalCount="1">
+<file id="file-1" name="raw.txt">
+${'lossless tool result\n'.repeat(100)}
+</file>
+</knowledge_base_files>`;
+    mockAgentDocumentModel.findByParentAndFilename.mockResolvedValue(undefined);
+    mockAgentDocumentModel.listByParentAndFilename.mockResolvedValue([]);
+    mockAgentDocumentModel.create.mockResolvedValue({
+      accessSelf: AgentAccess.READ | AgentAccess.WRITE | AgentAccess.LIST,
+      content,
+      createdAt: new Date('2024-01-01T00:00:00.000Z'),
+      documentId: 'documents-raw',
+      fileType: 'text/plain',
+      filename: 'archive.txt',
+      id: 'agent-doc-raw',
+      metadata: null,
+      updatedAt: new Date('2024-01-02T00:00:00.000Z'),
+    });
+    const createSnapshotSpy = vi.spyOn(headlessEditor, 'createMarkdownEditorSnapshot');
+    const service = new AgentDocumentVfsService(db, userId);
+    const node = await service.write(
+      './archive.txt',
+      content,
+      { agentId: 'agent-1' },
+      {
+        contentFormat: 'raw',
+      },
+    );
+
+    expect(createSnapshotSpy).not.toHaveBeenCalled();
+    expect(node.contentType).toBe('text/plain');
+    expect(mockAgentDocumentModel.create).toHaveBeenCalledWith('agent-1', 'archive.txt', content, {
+      fileType: 'text/plain',
+      parentId: null,
+      title: 'archive.txt',
+    });
+  });
+
+  it('overwrites raw ordinary file content without Markdown serialization', async () => {
+    const existing = {
+      accessSelf: AgentAccess.READ | AgentAccess.WRITE | AgentAccess.LIST,
+      content: 'old content',
+      createdAt: new Date('2024-01-01T00:00:00.000Z'),
+      documentId: 'documents-raw',
+      fileType: 'text/plain',
+      filename: 'archive.txt',
+      id: 'agent-doc-raw',
+      metadata: null,
+      updatedAt: new Date('2024-01-02T00:00:00.000Z'),
+    };
+    mockAgentDocumentModel.findByParentAndFilename.mockResolvedValue(existing);
+    mockAgentDocumentModel.update.mockImplementation(async (_id, params) => {
+      Object.assign(existing, params);
+    });
+    const createSnapshotSpy = vi.spyOn(headlessEditor, 'createMarkdownEditorSnapshot');
+    const service = new AgentDocumentVfsService(db, userId);
+
+    await service.write(
+      './archive.txt',
+      'new raw content',
+      { agentId: 'agent-1' },
+      {
+        contentFormat: 'raw',
+      },
+    );
+
+    expect(createSnapshotSpy).not.toHaveBeenCalled();
+    expect(mockAgentDocumentModel.update).toHaveBeenCalledWith('agent-doc-raw', {
+      content: 'new raw content',
+      editorData: null,
+      fileType: 'text/plain',
+    });
   });
 
   it('resolves duplicate ordinary path segments to the oldest sibling', async () => {
@@ -658,6 +761,12 @@ describe('AgentDocumentVfsService', () => {
   });
 
   it('permanently deletes ordinary directory subtrees child-first', async () => {
+    // ROOT CAUSE:
+    // Permanent deletion removed document rows without reclaiming hidden backing uploads.
+    // Returned file IDs now go through reference-safe cleanup after each committed deletion.
+    mockAgentDocumentModel.permanentlyDelete
+      .mockResolvedValueOnce(['child-file'])
+      .mockResolvedValueOnce([]);
     mockAgentDocumentModel.findByIdWithOptions.mockResolvedValue({
       accessSelf: AgentAccess.READ | AgentAccess.WRITE | AgentAccess.LIST,
       content: '',
@@ -698,6 +807,8 @@ describe('AgentDocumentVfsService', () => {
       2,
       'folder-agent-doc-1',
     );
+    /** @example The child upload is reclaimed using the dedicated source policy. */
+    expect(removeUnreferencedFile.mock.calls).toEqual([['child-file', FileSource.AgentDocument]]);
   });
 
   it('opts read-only mounted skill paths out of trash deletes', async () => {

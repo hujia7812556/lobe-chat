@@ -1,15 +1,24 @@
 'use client';
 
 import isEqual from 'fast-deep-equal';
-import type { KeyboardEvent, PointerEvent, ReactElement, ReactNode } from 'react';
-import { memo, useCallback, useEffect, useMemo, useRef } from 'react';
+import type {
+  KeyboardEvent,
+  PointerEvent,
+  ReactElement,
+  ReactNode,
+  TouchEvent,
+  WheelEvent,
+} from 'react';
+import { lazy, memo, Suspense, useCallback, useEffect, useMemo, useRef } from 'react';
 import type { VListHandle } from 'virtua';
 import { VList } from 'virtua';
 import { useShallow } from 'zustand/react/shallow';
 
+import { useDevDockMounted } from '@/hooks/useDevDockMounted';
 import { messageMapKey } from '@/store/chat/utils/messageMapKey';
 
 import WideScreenContainer from '../../../WideScreenContainer';
+import { MessageForwardSelectToHere } from '../../MessageForward';
 import {
   dataSelectors,
   inputSelectors,
@@ -21,16 +30,30 @@ import {
   CONVERSATION_SPACER_TRANSITION_MS,
   useConversationScroll,
 } from '../hooks/useConversationScroll';
+import { useEarlierHistoryTrigger } from '../hooks/useEarlierHistoryTrigger';
 import { useSelectionMessageIds } from '../hooks/useSelectionMessageIds';
 import { useTopicScrollPersist } from '../hooks/useTopicScrollPersist';
+import type { ResolvedMessageDeepLink } from '../utils/messageDeepLink';
 import AutoScroll from './AutoScroll';
 import { AT_BOTTOM_THRESHOLD } from './AutoScroll/const';
-import DebugInspector, { OPEN_DEV_INSPECTOR } from './AutoScroll/DebugInspector';
 import { useAutoScrollEnabled } from './AutoScroll/useAutoScrollEnabled';
 import BackBottom from './BackBottom';
+import EarlierHistoryError from './EarlierHistoryError';
+import EarlierHistorySkeleton from './EarlierHistorySkeleton';
+
+const DebugInspector = lazy(() => import('./AutoScroll/DebugInspector'));
 
 const CONVERSATION_FOOTER_ID = '__conversation_footer__';
 const CONVERSATION_HEADER_ID = '__conversation_header__';
+// One synthetic leading row always precedes the messages: it holds the
+// header slot and, while a page of pre-window history is in flight, the
+// conversation skeleton. Keeping it permanent matters because virtua keys
+// rows by index — inserting a row on load start would shift every index
+// and remount each message, dropping local UI state such as an expanded
+// workflow fold. All index-based APIs exposed to the store (and the hooks
+// that talk to virtua directly) work in MESSAGE index space; this offset
+// translates at the virtua boundary.
+const LEADING_ROWS = 1;
 const USER_SCROLL_INTENT_TTL_MS = 500;
 const SCROLL_KEYS = new Set(['ArrowDown', 'ArrowUp', 'End', 'Home', 'PageDown', 'PageUp', ' ']);
 
@@ -39,6 +62,7 @@ interface VirtualizedListProps {
   footerSlot?: ReactNode;
   headerSlot?: ReactNode;
   itemContent: (index: number, data: string) => ReactNode;
+  messageDeepLink?: ResolvedMessageDeepLink;
 }
 
 /**
@@ -47,8 +71,9 @@ interface VirtualizedListProps {
  * Based on ConversationStore data flow, no dependency on global ChatStore.
  */
 const VirtualizedList = memo<VirtualizedListProps>(
-  ({ dataSource, footerSlot, headerSlot, itemContent }) => {
+  ({ dataSource, footerSlot, headerSlot, itemContent, messageDeepLink }) => {
     const virtuaRef = useRef<VListHandle>(null);
+    const containerRef = useRef<HTMLDivElement>(null);
     const scrollEndTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const lastUserScrollIntentAtRef = useRef(0);
 
@@ -58,7 +83,10 @@ const VirtualizedList = memo<VirtualizedListProps>(
     const contextKey = useConversationStore((s) => messageMapKey(s.context));
     const { recordScroll } = useTopicScrollPersist({
       contextKey,
+      containerRef,
       dataSourceLength: dataSource.length,
+      headerOffset: LEADING_ROWS,
+      messageDeepLink,
       virtuaRef,
     });
 
@@ -76,19 +104,30 @@ const VirtualizedList = memo<VirtualizedListProps>(
       spacerActive,
       spacerHeight,
     } = useConversationScroll({
+      contextKey,
       dataSource,
+      headerOffset: LEADING_ROWS,
       isSecondLastMessageFromUser,
       virtuaRef,
     });
 
     const isAutoScrollEnabled = useAutoScrollEnabled();
+    const devDockMounted = useDevDockMounted();
+
+    // While multi-selecting, let message rows span the full stream width so the
+    // clickable/highlight band fills the available space instead of the centered
+    // reading column.
+    const isSelectionMode = useConversationStore(messageStateSelectors.isSelectionMode);
 
     // Store actions
+    const loadEarlierMessages = useConversationStore((s) => s.loadEarlierMessages);
     const registerVirtuaScrollMethods = useConversationStore((s) => s.registerVirtuaScrollMethods);
     const setScrollState = useConversationStore((s) => s.setScrollState);
     const resetVisibleItems = useConversationStore((s) => s.resetVisibleItems);
     const setActiveIndex = useConversationStore((s) => s.setActiveIndex);
     const activeIndex = useConversationStore(virtuaListSelectors.activeIndex);
+
+    const earlierHistory = useEarlierHistoryTrigger({ loadEarlierMessages, virtuaRef });
 
     const markUserScrollIntent = useCallback(() => {
       lastUserScrollIntentAtRef.current = Date.now();
@@ -108,8 +147,25 @@ const VirtualizedList = memo<VirtualizedListProps>(
         if (SCROLL_KEYS.has(event.key)) {
           markUserScrollIntent();
         }
+        earlierHistory.onKeyDown(event);
       },
-      [markUserScrollIntent],
+      [earlierHistory, markUserScrollIntent],
+    );
+
+    const handleWheel = useCallback(
+      (event: WheelEvent<HTMLDivElement>) => {
+        markUserScrollIntent();
+        earlierHistory.onWheel(event);
+      },
+      [earlierHistory, markUserScrollIntent],
+    );
+
+    const handleTouchMove = useCallback(
+      (event: TouchEvent<HTMLDivElement>) => {
+        markUserScrollIntent();
+        earlierHistory.onTouchMove(event);
+      },
+      [earlierHistory, markUserScrollIntent],
     );
 
     // Check if at bottom based on scroll position
@@ -131,8 +187,12 @@ const VirtualizedList = memo<VirtualizedListProps>(
         refForActive && typeof refForActive.findItemIndex === 'function'
           ? refForActive.findItemIndex(refForActive.scrollOffset + refForActive.viewportSize * 0.25)
           : null;
+      // findItemIndex returns a virtua row index — translate to message space
+      // (the header row clamps to the first message).
       const activeFromFind =
-        typeof activeFromFindRaw === 'number' && activeFromFindRaw >= 0 ? activeFromFindRaw : null;
+        typeof activeFromFindRaw === 'number' && activeFromFindRaw >= 0
+          ? Math.max(0, activeFromFindRaw - LEADING_ROWS)
+          : null;
 
       if (activeFromFind !== activeIndex) setActiveIndex(activeFromFind);
 
@@ -144,6 +204,9 @@ const VirtualizedList = memo<VirtualizedListProps>(
         const hasUserScrollIntent =
           Date.now() - lastUserScrollIntentAtRef.current <= USER_SCROLL_INTENT_TTL_MS;
         onScrollOffset(ref.scrollOffset, hasUserScrollIntent);
+
+        // Programmatic mount/restore scrolls carry no intent and never fetch.
+        if (hasUserScrollIntent) earlierHistory.onUserScroll();
       }
 
       // Check if at bottom
@@ -163,7 +226,15 @@ const VirtualizedList = memo<VirtualizedListProps>(
       scrollEndTimerRef.current = setTimeout(() => {
         setScrollState({ isScrolling: false });
       }, 150);
-    }, [activeIndex, checkAtBottom, onScrollOffset, recordScroll, setActiveIndex, setScrollState]);
+    }, [
+      activeIndex,
+      checkAtBottom,
+      earlierHistory,
+      onScrollOffset,
+      recordScroll,
+      setActiveIndex,
+      setScrollState,
+    ]);
 
     const handleScrollEnd = useCallback(() => {
       setScrollState({ isScrolling: false });
@@ -173,21 +244,25 @@ const VirtualizedList = memo<VirtualizedListProps>(
     useEffect(() => {
       const ref = virtuaRef.current;
       if (ref) {
+        // Index-based methods accept MESSAGE indices; the header slot row is a
+        // private implementation detail translated away right here.
         registerVirtuaScrollMethods({
-          getItemOffset: (index) => ref.getItemOffset(index),
-          getItemSize: (index) => ref.getItemSize(index),
+          getItemOffset: (index) => ref.getItemOffset(index + LEADING_ROWS),
+          getItemSize: (index) => ref.getItemSize(index + LEADING_ROWS),
           getScrollOffset: () => ref.scrollOffset,
           getScrollSize: () => ref.scrollSize,
           getTotalCount: () => totalCountRef.current,
           getViewportSize: () => ref.viewportSize,
           scrollTo: (offset) => ref.scrollTo(offset),
-          scrollToIndex: (index, options) => ref.scrollToIndex(index, options),
+          scrollToIndex: (index, options) => ref.scrollToIndex(index + LEADING_ROWS, options),
         });
 
         // Seed active index once on mount (avoid requiring user scroll)
         const initialActiveRaw = ref.findItemIndex(ref.scrollOffset + ref.viewportSize * 0.25);
         const initialActive =
-          typeof initialActiveRaw === 'number' && initialActiveRaw >= 0 ? initialActiveRaw : null;
+          typeof initialActiveRaw === 'number' && initialActiveRaw >= 0
+            ? Math.max(0, initialActiveRaw - LEADING_ROWS)
+            : null;
         setActiveIndex(initialActive);
       }
 
@@ -214,7 +289,7 @@ const VirtualizedList = memo<VirtualizedListProps>(
         for (let i = 0; i < dataSource.length; i++) {
           const id = dataSource[i];
           if (!id) continue;
-          if (messageStateSelectors.isMessageGenerating(id)(s)) indices.push(i);
+          if (messageStateSelectors.isRowGenerating(id)(s)) indices.push(i);
         }
         return indices;
       }),
@@ -222,7 +297,10 @@ const VirtualizedList = memo<VirtualizedListProps>(
 
     // Also keep items that host the active text selection — unmounting a node
     // containing a Selection endpoint would silently drop the user's highlight.
-    const selectionMessageIds = useSelectionMessageIds();
+    const selectedNodeIds = useSelectionMessageIds();
+    const selectionMessageIds = useConversationStore(
+      useShallow((s) => new Set([...selectedNodeIds].map((id) => dataSelectors.hostRowOf(id)(s)))),
+    );
 
     const keepMountedIndices = useMemo(() => {
       if (selectionMessageIds.size === 0) return streamingIndices;
@@ -248,41 +326,67 @@ const VirtualizedList = memo<VirtualizedListProps>(
     const paddingBottom = Math.max(24, overlayHeight + 12);
 
     const dataWithSlots = useMemo(
-      () => [
-        ...(headerSlot ? [CONVERSATION_HEADER_ID] : []),
-        ...listData,
-        ...(footerSlot ? [CONVERSATION_FOOTER_ID] : []),
-      ],
-      [footerSlot, headerSlot, listData],
+      () => [CONVERSATION_HEADER_ID, ...listData, ...(footerSlot ? [CONVERSATION_FOOTER_ID] : [])],
+      [footerSlot, listData],
     );
 
+    // Prepend detection for virtua: when pre-window history loads, the former
+    // first message moves down the list. Passing `shift` for exactly that
+    // render keeps the viewport anchored on the rows the user was reading
+    // instead of snapping to the (new) top. Removals and topic switches drop
+    // the previous first id from the list entirely and stay unshifted.
+    const firstMessageId = listData[0] as string | undefined;
+    const prevFirstMessageIdRef = useRef(firstMessageId);
+    const prevFirstMessageId = prevFirstMessageIdRef.current;
+    const shift =
+      prevFirstMessageId !== undefined &&
+      firstMessageId !== prevFirstMessageId &&
+      listData.includes(prevFirstMessageId);
+    useEffect(() => {
+      prevFirstMessageIdRef.current = firstMessageId;
+    });
+
+    // The leading row is pinned: it is zero-height while idle, and virtua
+    // excludes a zero-height row at the top from its render range, so it
+    // would never mount to show the skeleton it hosts.
     const keepMountedIndicesWithSlots = useMemo(
-      () => (headerSlot ? keepMountedIndices.map((index) => index + 1) : keepMountedIndices),
-      [headerSlot, keepMountedIndices],
+      () => [0, ...keepMountedIndices.map((index) => index + LEADING_ROWS)],
+      [keepMountedIndices],
     );
 
     // Mirror the latest data length into a ref so the scroll-methods registered
-    // once on mount can read the current total count (including spacer/footer)
-    // without re-registering on every render.
-    const totalCountRef = useRef(dataWithSlots.length);
-    totalCountRef.current = dataWithSlots.length;
+    // once on mount can read the current total count (including spacer/footer,
+    // but excluding the leading header row — the count stays in the same
+    // message-index space as the registered scrollToIndex) without
+    // re-registering on every render.
+    const totalCountRef = useRef(dataWithSlots.length - LEADING_ROWS);
+    totalCountRef.current = dataWithSlots.length - LEADING_ROWS;
 
     return (
       <div
+        ref={containerRef}
         style={{ height: '100%', position: 'relative' }}
         onKeyDownCapture={handleKeyDown}
         onPointerDownCapture={markUserScrollIntent}
         onPointerMoveCapture={handlePointerMove}
-        onTouchMoveCapture={markUserScrollIntent}
-        onWheelCapture={markUserScrollIntent}
+        onTouchMoveCapture={handleTouchMove}
+        onTouchStartCapture={earlierHistory.onTouchStart}
+        onWheelCapture={handleWheel}
       >
+        {/* Pinned to the list viewport top; only renders while multi-selecting */}
+        <MessageForwardSelectToHere />
         {/* Debug Inspector - placed outside VList so it won't be recycled by the virtual list */}
-        {OPEN_DEV_INSPECTOR && <DebugInspector />}
+        {devDockMounted && (
+          <Suspense fallback={null}>
+            <DebugInspector />
+          </Suspense>
+        )}
         <VList
           bufferSize={typeof window !== 'undefined' ? window.innerHeight : 0}
           data={dataWithSlots}
           keepMounted={keepMountedIndicesWithSlots}
           ref={virtuaRef}
+          shift={shift}
           style={{ height: '100%', overflowAnchor: 'none', paddingBottom }}
           onScroll={handleScroll}
           onScrollEnd={handleScrollEnd}
@@ -292,6 +396,8 @@ const VirtualizedList = memo<VirtualizedListProps>(
               return (
                 <WideScreenContainer key={messageId} style={{ position: 'relative' }}>
                   {headerSlot}
+                  <EarlierHistorySkeleton />
+                  <EarlierHistoryError />
                 </WideScreenContainer>
               );
             }
@@ -328,7 +434,7 @@ const VirtualizedList = memo<VirtualizedListProps>(
             }
 
             const isAgentCouncil = messageId.includes('agentCouncil');
-            const messageIndex = headerSlot ? index - 1 : index;
+            const messageIndex = index - LEADING_ROWS;
             const isLastItem = messageIndex === dataSource.length - 1;
             const content = itemContent(messageIndex, messageId);
 
@@ -344,7 +450,11 @@ const VirtualizedList = memo<VirtualizedListProps>(
             }
 
             return (
-              <WideScreenContainer key={messageId} style={{ position: 'relative' }}>
+              <WideScreenContainer
+                fullWidth={isSelectionMode}
+                key={messageId}
+                style={{ position: 'relative' }}
+              >
                 {content}
                 {isLastItem && isAutoScrollEnabled && !spacerActive && <AutoScroll />}
               </WideScreenContainer>

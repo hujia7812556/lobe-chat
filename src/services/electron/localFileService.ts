@@ -2,23 +2,34 @@ import { MARKDOWN_MIME_TYPES } from '@lobechat/const';
 import {
   type AuditSafePathsParams,
   type AuditSafePathsResult,
+  type CopyLocalFilesParams,
+  type CreateLocalDirectoryParams,
+  type CreateLocalEntryResult,
+  type CreateLocalFileParams,
+  type DeviceSandboxCapabilityResult,
+  type DeviceSandboxInstallResult,
   type EditLocalFileParams,
   type EditLocalFileResult,
+  type EnsureSandboxWorkspaceParams,
+  type EnsureSandboxWorkspaceResult,
   type GetCommandOutputParams,
   type GetCommandOutputResult,
   type GlobFilesParams,
   type GlobFilesResult,
   type GrepContentParams,
   type GrepContentResult,
+  type HashLocalFileParams,
   type KillCommandParams,
   type KillCommandResult,
   type ListLocalFileParams,
   type ListLocalFilesResult,
   type ListProjectSkillsParams,
   type ListProjectSkillsResult,
+  type LocalCopyFilesResultItem,
   type LocalFileItem,
   type LocalFilePreviewUrlParams,
-  type LocalFilePreviewUrlResult,
+  type LocalFileStats,
+  type LocalFileStatsParams,
   type LocalMoveFilesResultItem,
   type LocalReadFileParams,
   type LocalReadFileResult,
@@ -29,8 +40,12 @@ import {
   type OpenLocalFolderParams,
   type PrepareSkillDirectoryParams,
   type PrepareSkillDirectoryResult,
+  type ProjectDirectoryListParams,
+  type ProjectDirectoryListResult,
   type ProjectFileIndexParams,
   type ProjectFileIndexResult,
+  type ProjectFileSearchParams,
+  type ProjectFileSearchResult,
   type RenameLocalFileParams,
   type ResolveSkillResourcePathParams,
   type ResolveSkillResourcePathResult,
@@ -38,6 +53,8 @@ import {
   type RunCommandResult,
   type ShowSaveDialogParams,
   type ShowSaveDialogResult,
+  type TrashLocalFilesParams,
+  type TrashLocalFilesResult,
   type WriteLocalFileParams,
 } from '@lobechat/electron-client-ipc';
 
@@ -56,7 +73,19 @@ const TEXT_PREVIEW_MIME_TYPES = new Set([
 
 export interface BinaryLocalFilePreview {
   contentType: string;
-  type: 'binary' | 'pdf' | 'video';
+  /** The file has a previewable type but exceeds the in-app preview size cap. */
+  oversized?: boolean;
+  type: 'binary' | 'pdf';
+}
+
+/**
+ * Binary document (pdf / office) small enough to preview in-app. Oversized
+ * documents stay on the content-less `binary` / `pdf` variants.
+ */
+export interface DocumentLocalFilePreview {
+  blob: Blob;
+  contentType: string;
+  type: 'document';
 }
 
 export interface ImageLocalFilePreview {
@@ -68,13 +97,63 @@ export interface ImageLocalFilePreview {
 export interface TextLocalFilePreview {
   content: string;
   contentType: string;
+  resourceBaseUrl?: string;
   type: 'text';
+}
+
+/**
+ * A playable local video. Carries no bytes on purpose: the preview result is
+ * cached by SWR for the whole session, so the player reads the file itself
+ * (`readLocalVideo`) and releases it when it unmounts.
+ */
+export interface VideoLocalFilePreview {
+  contentType: string;
+  /**
+   * Identity of the file contents (size + mtime). Changes when the file at the
+   * same path is replaced, so a refreshed preview tells the player to re-read.
+   */
+  revision: string;
+  type: 'video';
 }
 
 export type LocalFilePreview =
   | BinaryLocalFilePreview
+  | DocumentLocalFilePreview
   | ImageLocalFilePreview
-  | TextLocalFilePreview;
+  | TextLocalFilePreview
+  | VideoLocalFilePreview;
+
+/** Binary documents the in-app portal can preview (or offer to download). */
+const DOCUMENT_PREVIEW_MIME_TYPES = new Set([
+  'application/msword',
+  'application/pdf',
+  'application/vnd.ms-excel',
+  'application/vnd.ms-powerpoint',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+]);
+
+/**
+ * Mirrors the device-RPC document cap (`MAX_DOCUMENT_PREVIEW_BYTES` in the
+ * desktop / device-control serializers) so the same file previews — or falls
+ * back — identically on every transport.
+ */
+const MAX_DOCUMENT_PREVIEW_BYTES = 20 * 1024 * 1024;
+
+/**
+ * Videos above this size fall back to the `binary` placeholder: the desktop
+ * protocol serves the whole file in one response, so the blob lives in renderer
+ * memory for as long as the preview is open.
+ */
+const MAX_VIDEO_PREVIEW_BYTES = 200 * 1024 * 1024;
+
+const isOversizedVideo = (response: Response): boolean => {
+  const contentLength = Number(response.headers.get('content-length'));
+  return Number.isFinite(contentLength) && contentLength > MAX_VIDEO_PREVIEW_BYTES;
+};
+
+export type ReadLocalVideoResult = { blob: Blob; ok: true } | { ok: false; reason: 'oversized' };
 
 const normalizeContentType = (contentType: string | null): string =>
   contentType?.split(';')[0].trim().toLowerCase() ?? '';
@@ -85,6 +164,7 @@ const isTextPreviewMimeType = (mimeType: string): boolean =>
 const fetchLocalFilePreview = async (
   url: string,
   accept?: LocalFilePreviewUrlParams['accept'],
+  resourceScope?: LocalFilePreviewUrlParams['resourceScope'],
 ): Promise<LocalFilePreview> => {
   const response = await fetch(url);
 
@@ -103,7 +183,34 @@ const fetchLocalFilePreview = async (
   }
 
   if (isTextPreviewMimeType(contentType)) {
-    return { content: await response.text(), contentType, type: 'text' };
+    return {
+      content: await response.text(),
+      contentType,
+      resourceBaseUrl: resourceScope === 'workspace' ? new URL('.', url).toString() : undefined,
+      type: 'text',
+    };
+  }
+
+  if (DOCUMENT_PREVIEW_MIME_TYPES.has(contentType)) {
+    // Gate on the size headers first so an oversized document is never
+    // materialized in renderer memory just to be discarded. The desktop
+    // protocol short-circuits oversized documents with an empty body and the
+    // real size in `X-Preview-Content-Size`; Content-Length covers hosts that
+    // still serve the body. Fall back to the blob-size check otherwise.
+    const contentLength = Number(
+      response.headers.get('x-preview-content-size') ?? response.headers.get('content-length'),
+    );
+    const oversizedByHeader =
+      Number.isFinite(contentLength) &&
+      contentLength > 0 &&
+      contentLength > MAX_DOCUMENT_PREVIEW_BYTES;
+
+    if (!oversizedByHeader) {
+      const blob = await response.blob();
+      if (blob.size <= MAX_DOCUMENT_PREVIEW_BYTES) {
+        return { blob, contentType, type: 'document' };
+      }
+    }
   }
 
   if (contentType === 'application/pdf') {
@@ -111,10 +218,35 @@ const fetchLocalFilePreview = async (
   }
 
   if (contentType.startsWith('video/')) {
-    return { contentType, type: 'video' };
+    // The player reads the bytes on its own; don't hold them here.
+    void response.body?.cancel().catch(() => {});
+
+    return isOversizedVideo(response)
+      ? { contentType, oversized: true, type: 'binary' }
+      : {
+          contentType,
+          revision: [
+            response.headers.get('content-length') ?? '',
+            response.headers.get('x-preview-modified-at') ?? '',
+          ].join(':'),
+          type: 'video',
+        };
   }
 
   return { contentType, type: 'binary' };
+};
+
+const fetchLocalFileBytes = async (
+  url: string,
+): Promise<{ bytes: Uint8Array; contentType: string } | undefined> => {
+  const response = await fetch(url);
+  if (!response.ok) return;
+
+  return {
+    bytes: new Uint8Array(await response.arrayBuffer()),
+    contentType:
+      normalizeContentType(response.headers.get('content-type')) || 'application/octet-stream',
+  };
 };
 
 class LocalFileService {
@@ -127,6 +259,14 @@ class LocalFileService {
     return ensureElectronIpc().localSystem.readFile(params);
   }
 
+  async hashLocalFile(params: HashLocalFileParams): Promise<string> {
+    return ensureElectronIpc().localSystem.hashLocalFile(params);
+  }
+
+  async getLocalFileStats(params: LocalFileStatsParams): Promise<LocalFileStats> {
+    return ensureElectronIpc().localSystem.getLocalFileStats(params);
+  }
+
   async readLocalFiles(params: LocalReadFilesParams): Promise<LocalReadFileResult[]> {
     return ensureElectronIpc().localSystem.readFiles(params);
   }
@@ -137,6 +277,16 @@ class LocalFileService {
 
   async getProjectFileIndex(params: ProjectFileIndexParams): Promise<ProjectFileIndexResult> {
     return ensureElectronIpc().localSystem.getProjectFileIndex(params);
+  }
+
+  async searchProjectFiles(params: ProjectFileSearchParams): Promise<ProjectFileSearchResult> {
+    return ensureElectronIpc().localSystem.searchProjectFiles(params);
+  }
+
+  async listProjectDirectory(
+    params: ProjectDirectoryListParams,
+  ): Promise<ProjectDirectoryListResult> {
+    return ensureElectronIpc().localSystem.listProjectDirectory(params);
   }
 
   async listProjectSkills(params: ListProjectSkillsParams): Promise<ListProjectSkillsResult> {
@@ -166,24 +316,93 @@ class LocalFileService {
     return ensureElectronIpc().localSystem.handleWriteFile(params);
   }
 
+  /** Create a new file; fails instead of overwriting an existing one. */
+  async createLocalFile(params: CreateLocalFileParams): Promise<CreateLocalEntryResult> {
+    return ensureElectronIpc().localSystem.handleCreateFile(params);
+  }
+
+  /** Create a new folder; fails when the path is already taken. */
+  async createLocalDirectory(params: CreateLocalDirectoryParams): Promise<CreateLocalEntryResult> {
+    return ensureElectronIpc().localSystem.handleCreateDirectory(params);
+  }
+
+  /** Copy files/folders, or duplicate in place when an item has no `targetPath`. */
+  async copyLocalFiles(params: CopyLocalFilesParams): Promise<LocalCopyFilesResultItem[]> {
+    return ensureElectronIpc().localSystem.handleCopyFiles(params);
+  }
+
+  /** Move files/folders to the OS trash (recoverable), reporting each path. */
+  async trashLocalFiles(params: TrashLocalFilesParams): Promise<TrashLocalFilesResult> {
+    return ensureElectronIpc().localSystem.trashLocalFiles(params);
+  }
+
   async auditSafePaths(params: AuditSafePathsParams): Promise<AuditSafePathsResult> {
     return ensureElectronIpc().localSystem.auditSafePaths(params);
   }
 
-  async getLocalFilePreviewUrl(
-    params: LocalFilePreviewUrlParams,
-  ): Promise<LocalFilePreviewUrlResult> {
-    return ensureElectronIpc().localSystem.getLocalFilePreviewUrl(params);
-  }
-
   async getLocalFilePreview(params: LocalFilePreviewUrlParams): Promise<LocalFilePreview> {
-    const result = await this.getLocalFilePreviewUrl(params);
+    const result = await ensureElectronIpc().localSystem.getLocalFilePreviewUrl(params);
 
     if (!result.success || !result.url) {
       throw new Error(result.error || 'Missing local file preview URL');
     }
 
-    return fetchLocalFilePreview(result.url, params.accept);
+    return fetchLocalFilePreview(result.url, params.accept, params.resourceScope);
+  }
+
+  async readLocalFileBytes(
+    params: LocalFilePreviewUrlParams,
+  ): Promise<{ bytes: Uint8Array; contentType: string } | undefined> {
+    const result = await ensureElectronIpc().localSystem.getLocalFilePreviewUrl(params);
+
+    if (!result.success || !result.url) return;
+
+    return fetchLocalFileBytes(result.url);
+  }
+
+  /**
+   * Read a local video for playback. Pass the player's abort signal so closing
+   * the preview mid-read drops the bytes instead of finishing the download.
+   */
+  async readLocalVideo(
+    params: LocalFilePreviewUrlParams,
+    signal?: AbortSignal,
+  ): Promise<ReadLocalVideoResult> {
+    const result = await ensureElectronIpc().localSystem.getLocalFilePreviewUrl(params);
+
+    if (!result.success || !result.url) {
+      throw new Error(result.error || 'Missing local file preview URL');
+    }
+
+    const response = await fetch(result.url, { signal });
+    if (!response.ok) throw new Error(`Failed to load local file: ${response.status}`);
+    if (isOversizedVideo(response)) {
+      void response.body?.cancel().catch(() => {});
+      return { ok: false, reason: 'oversized' };
+    }
+
+    const blob = await response.blob();
+    return blob.size > MAX_VIDEO_PREVIEW_BYTES
+      ? { ok: false, reason: 'oversized' }
+      : { blob, ok: true };
+  }
+
+  async readExternalAssetForPublish(params: {
+    path: string;
+    workingDirectory: string;
+  }): Promise<{ bytes: Uint8Array; contentType: string } | undefined> {
+    const result = await ensureElectronIpc().localSystem.getExternalAssetForPublishUrl(params);
+    if (!result.success || !result.url) return;
+
+    return fetchLocalFileBytes(result.url);
+  }
+
+  async copyAssetForPublish(params: {
+    from: string;
+    to: string;
+    workingDirectory: string;
+  }): Promise<{ error?: string; success: boolean }> {
+    return ensureElectronIpc().localSystem.copyAssetForPublish(params);
   }
 
   async prepareSkillDirectory(
@@ -205,6 +424,34 @@ class LocalFileService {
   // Shell Commands
   async runCommand(params: RunCommandParams): Promise<RunCommandResult> {
     return ensureElectronIpc().shellCommand.handleRunCommand(params);
+  }
+
+  /**
+   * Whether this machine can run sandboxed commands. Asked before offering the
+   * "Local Sandbox" execution environment — the host, not the platform string,
+   * is the authority (Linux support depends on binaries that may be absent).
+   */
+  async getSandboxCapability(): Promise<DeviceSandboxCapabilityResult> {
+    return ensureElectronIpc().shellCommand.getSandboxCapability();
+  }
+
+  /**
+   * Provision the sandbox backend on this machine (one elevation prompt on
+   * Windows) and report the capability afterwards. User-initiated only.
+   */
+  async installSandbox(): Promise<DeviceSandboxInstallResult> {
+    return ensureElectronIpc().shellCommand.installSandbox();
+  }
+
+  /**
+   * Create (and return) the default directory a sandboxed agent should work in.
+   * The caller persists it as the agent's working directory, so the default is
+   * visible and changeable rather than hidden.
+   */
+  async ensureSandboxWorkspace(
+    params: EnsureSandboxWorkspaceParams,
+  ): Promise<EnsureSandboxWorkspaceResult> {
+    return ensureElectronIpc().shellCommand.ensureSandboxWorkspace(params);
   }
 
   async getCommandOutput(params: GetCommandOutputParams): Promise<GetCommandOutputResult> {

@@ -1,6 +1,8 @@
 import { z } from 'zod';
 
 import { RequestTrigger } from '../../agentRuntime';
+import type { ContextSelection } from './contextSelection';
+import { ContextSelectionSchema } from './contextSelection';
 import type { PageSelection } from './pageSelection';
 import { PageSelectionSchema } from './pageSelection';
 
@@ -95,6 +97,10 @@ export interface ModelTokensUsage {
 
   // Output tokens breakdown
   outputTextTokens?: number;
+  /**
+   * Generated video tokens, billed through the `videoGeneration` pricing unit.
+   */
+  outputVideoTokens?: number;
   rejectedPredictionTokens?: number;
 
   // Total tokens
@@ -125,6 +131,7 @@ export const ModelUsageSchema = z.object({
   outputImageTokens: z.number().optional(),
   outputAudioTokens: z.number().optional(),
   outputReasoningTokens: z.number().optional(),
+  outputVideoTokens: z.number().optional(),
 
   // Prediction tokens
   acceptedPredictionTokens: z.number().optional(),
@@ -137,6 +144,9 @@ export const ModelUsageSchema = z.object({
 
   // Cost
   cost: z.number().optional(),
+
+  // Provider-native subscription credits (e.g. Qoder), separate from USD cost
+  credits: z.number().optional(),
 });
 
 export const ModelPerformanceSchema = z.object({
@@ -167,12 +177,109 @@ export const MessageSignalSchema = z.object({
   type: z.enum(['tool-stdout', 'tool-callback', 'task-completion']),
 });
 
+export const MessageTaskCallbackSchema = z.object({
+  // Task identifier (e.g. `T-42`) for the card header + jump link.
+  identifier: z.string(),
+  // Terminal outcome of the task run that produced this callback.
+  reason: z.enum(['done', 'error', 'interrupted']),
+  // The task id (jump target → task detail).
+  taskId: z.string(),
+  // The completed task topic, for an optional "view run" link.
+  topicId: z.string().optional(),
+});
+
+export const MessageWorkMetadataSchema = z.object({
+  rootOperationId: z.string().min(1),
+  userMessageId: z.string().optional(),
+});
+
+export const AgentDispatchMetadataSchema = z.object({
+  kind: z.enum(['callAgent']),
+  visibility: z.literal('internal'),
+});
+
+export interface AgentDispatchMetadata {
+  kind: 'callAgent';
+  visibility: 'internal';
+}
+
+/**
+ * Where a server-injected user turn came from when no human typed it: a
+ * provider event (GitHub CI failure, review feedback, …) that woke the
+ * agent. Rendered as a badge on the bubble and usable as a filter key.
+ */
+export interface ExternalOriginMetadata {
+  /** What happened, in the provider's event vocabulary (`ci_failed`, `review_changes_requested`, …). */
+  kind: string;
+  /** Human label of the resource, e.g. `lobehub/lobehub#19728`. */
+  label: string;
+  /** Provider id, e.g. `github`. */
+  provider: string;
+  /** LobeHub-side id of the tracked resource (`scm_change_requests.id`), for lookups. */
+  resourceId?: string;
+  /** Link to the provider resource. */
+  url?: string;
+}
+
+export const ExternalOriginMetadataSchema = z.object({
+  kind: z.string(),
+  label: z.string(),
+  provider: z.string(),
+  resourceId: z.string().optional(),
+  url: z.string().optional(),
+});
+
+export const BotSenderMetadataSchema = z.object({
+  avatar: z.string().optional(),
+  fullName: z.string().optional(),
+  id: z.string(),
+  platform: z.string(),
+  username: z.string().optional(),
+});
+
+/**
+ * The real platform author of a user message that arrived through a bot
+ * channel (Feishu, Discord, Slack, …). Such rows are inserted under the bot
+ * OWNER's `userId`, so the joined `sender` is the owner — this block carries
+ * the identity the UI should show instead.
+ */
+export interface BotSenderMetadata {
+  /** Absolute avatar URL when the platform exposes one. */
+  avatar?: string;
+  /** Platform display name / nickname. */
+  fullName?: string;
+  /** Platform user id (Feishu open_id, Discord snowflake, …). */
+  id: string;
+  /** Bot platform identifier, e.g. `feishu`, `discord`. */
+  platform: string;
+  /** Platform handle when distinct from the display name. */
+  username?: string;
+}
+
 export const MessageMetadataSchema = ModelUsageSchema.merge(ModelPerformanceSchema).extend({
+  botSender: BotSenderMetadataSchema.optional(),
+  externalOrigin: ExternalOriginMetadataSchema.optional(),
+  agentDispatch: AgentDispatchMetadataSchema.optional(),
   collapsed: z.boolean().optional(),
+  contextSelections: z.array(ContextSelectionSchema).optional(),
+  // Hetero-agent (Claude Code) per-message provenance. Listed here so zod does
+  // NOT strip them from writes going through UpdateMessageParamsSchema /
+  // CreateMessageParamsSchema (the renderer executor's `messageService` path).
+  heteroMessageId: z.string().optional(),
+  heteroSessionId: z.string().optional(),
+  // Durable watermark for replace-only heterogeneous tool-state snapshots.
+  // The pair is scoped by operation so a later run may restart seq at 1.
+  heterogeneousToolStateOperationId: z.string().optional(),
+  heterogeneousToolStateSeq: z.number().int().positive().optional(),
   inspectExpanded: z.boolean().optional(),
   isMultimodal: z.boolean().optional(),
   isSupervisor: z.boolean().optional(),
   localSystemToolSnapshots: z.array(LocalSystemToolSnapshotSchema).optional(),
+  // Creation provenance (agent operation that produced this message). Listed
+  // here so zod does NOT strip the runtime's stamp from writes going through
+  // CreateMessageParamsSchema / UpdateMessageParamsSchema.
+  operationId: z.string().min(1).optional(),
+  orchestrationRole: z.enum(['supervisor', 'member']).optional(),
   pageSelections: z.array(PageSelectionSchema).optional(),
   // Canonical nested shape — flat fields above are deprecated. Must be listed
   // here so zod doesn't strip them from writes going through UpdateMessageParamsSchema
@@ -182,12 +289,17 @@ export const MessageMetadataSchema = ModelUsageSchema.merge(ModelPerformanceSche
   scope: z.string().optional(),
   // External-signal lineage for Monitor-style callback turns ().
   signal: MessageSignalSchema.optional(),
+  steer: z.boolean().optional(),
   subAgentId: z.string().optional(),
+  // role='taskCallback' card: which task delivered its handoff back to this
+  // conversation, and the run outcome. The card header + jump link read this.
+  taskCallback: MessageTaskCallbackSchema.optional(),
   toolExecutionTimeMs: z.number().optional(),
   trigger: z.nativeEnum(RequestTrigger).optional(),
   // role='verify' card: which Agent Run (agent_operations.id) it renders.
   verifyOperationId: z.string().optional(),
   verifyRound: z.number().optional(),
+  work: MessageWorkMetadataSchema.optional(),
   // @deprecated token usage moved to the top-level `usage` column. Still listed
   // so zod doesn't strip `metadata.usage` from legacy writes during migration.
   usage: ModelUsageSchema.optional(),
@@ -198,6 +310,12 @@ export interface ModelUsage extends ModelTokensUsage {
    * dollar
    */
   cost?: number;
+  /**
+   * Provider-native subscription credits consumed (e.g. Qoder), for runs whose
+   * CLI reports credits instead of token counts. Not USD — separate from
+   * `cost` so spend math never mixes units.
+   */
+  credits?: number;
 }
 
 export interface ModelPerformance {
@@ -232,16 +350,77 @@ export interface MessageMetadata {
   activeBranchIndex?: number;
   activeColumn?: boolean;
   /**
+   * Marks a `role: 'tool'` message (a group broadcast tool call) as an
+   * AgentCouncil: its member responses render as one parallel-streaming block.
+   */
+  agentCouncil?: boolean;
+  /**
+   * Explicit transport semantics for an internal cross-agent dispatch turn.
+   * Renderers consume this marker instead of inferring intent from the message tree.
+   */
+  agentDispatch?: AgentDispatchMetadata;
+  /**
+   * Real platform author of a bot-channel user message; see `BotSenderMetadata`.
+   */
+  botSender?: BotSenderMetadata;
+  /**
    * Message collapse state
    * true: collapsed, false/undefined: expanded
    */
   collapsed?: boolean;
   compare?: boolean;
+  /**
+   * Generic context selections attached to user messages.
+   * Page selections remain mirrored in `pageSelections` for compatibility.
+   */
+  contextSelections?: ContextSelection[];
+  /**
+   * This row is a DUPLICATED transcript (agent/group copy, workspace import),
+   * not a generation event in its current scope: the tokens were consumed by
+   * the source, so usage REPORTS exclude it. The row keeps its own token/cost
+   * figures — they describe the generation the transcript records, and the
+   * chat UI and context engine read them — so this marker is the only thing
+   * separating "what this scope spent" from "what this transcript shows".
+   */
+  copied?: boolean;
   /** @deprecated use the top-level message `usage` field instead */
   cost?: number;
   /** @deprecated use `metadata.performance` instead */
   duration?: number;
+  /**
+   * Where the model request behind this message ran. `client`: the server
+   * relayed it to the user's device (a local model only that device can
+   * reach), so the platform neither paid for nor billed it. Absent: the server.
+   */
+  executionSite?: 'client';
+  /**
+   * The provider event that produced this server-injected user turn
+   * (GitHub CI failure, review feedback, …). See {@link ExternalOriginMetadata}.
+   */
+  externalOrigin?: ExternalOriginMetadata;
   finishType?: string;
+  /** Operation owning the durable heterogeneous tool-state watermark. */
+  heterogeneousToolStateOperationId?: string;
+  /** Last persisted replace-snapshot sequence for this tool message. */
+  heterogeneousToolStateSeq?: number;
+  /**
+   * The native id of this message inside the hetero agent (Claude Code /
+   * Codex) that produced it — forensic provenance tying a row back to its
+   * source.
+   *
+   * - live runs: the CC API `message.id` of the turn (all the stream exposes),
+   *   stamped by the server persistence handler and the renderer executor
+   * - imported transcripts: the record's own id in the source file (CC session
+   *   record `uuid`; codex call item `fc_...` / `ctc_...` id)
+   */
+  heteroMessageId?: string;
+  /**
+   * The CC-native session id this hetero-agent message was produced under.
+   * `topic.metadata.heteroSessionId` keeps only the single latest value (written
+   * at run end); this per-message copy lets a diff pinpoint the exact row where
+   * CC forked to a new session — the signal for a lost-`--resume` "session break".
+   */
+  heteroSessionId?: string;
   /** @deprecated use the top-level message `usage` field instead */
   inputAudioTokens?: number;
   /** @deprecated use the top-level message `usage` field instead */
@@ -295,6 +474,25 @@ export interface MessageMetadata {
    * Local-system tool snapshots materialized when the user sent @file mentions.
    */
   localSystemToolSnapshots?: LocalSystemToolSnapshot[];
+  /**
+   * Orchestration role of the message author within a group conversation.
+   * `'supervisor'` = the group's coordinating agent, `'member'` = a delegated
+   * member agent. Persisted as a snapshot at write time (not derived at render)
+   * so historical transcripts stay stable across later membership/role changes,
+   * and so the standard message `role` stays `'assistant'` (training-friendly).
+   * Supersedes the boolean {@link isSupervisor}, which is kept for back-compat.
+   */
+  /**
+   * Creation provenance: id of the agent operation that produced this message
+   * (`agent_operations.id`), stamped when the runtime creates the assistant
+   * row. Always the message's OWN operation — for sub-agent (callAgent) turns
+   * this is the sub-operation, not the root; climb `parent_operation_id` for
+   * the root. Do not confuse with `work.rootOperationId` (Work display anchor,
+   * root op, only on Work-producing rounds) or `verifyOperationId` (the run a
+   * verify card verifies).
+   */
+  operationId?: string;
+  orchestrationRole?: 'supervisor' | 'member';
   /** @deprecated use the top-level message `usage` field instead */
   outputAudioTokens?: number;
   /** @deprecated use the top-level message `usage` field instead */
@@ -344,12 +542,23 @@ export interface MessageMetadata {
    */
   signal?: MessageSignal;
   /**
+   * User message sent from the input queue while the previous turn was still
+   * running. Renders as a continuation of that turn instead of a new one.
+   */
+  steer?: boolean;
+  /**
    * Sub Agent ID - behavior depends on scope
    * - scope: 'sub_agent': conversation-flow will transform message.agentId to this value for display
    * - scope: 'group' | 'group_agent': indicates the agent that generated this message in group mode
    * Used by callAgent tool (sub_agent) and group orchestration (group modes)
    */
   subAgentId?: string;
+  /**
+   * Task-callback card pointer (for role='taskCallback' messages). Identifies
+   * the task whose handoff result was delivered back into this conversation and
+   * the run outcome; the card header + jump link read off it.
+   */
+  taskCallback?: MessageTaskCallback;
   taskTitle?: string;
   // message content is multimodal, display content in the streaming, won't save to db
   tempDisplayContent?: string;
@@ -378,12 +587,45 @@ export interface MessageMetadata {
    */
   usage?: ModelUsage;
   /**
+   * The model reported no usage, so the server estimated the token counts from
+   * the request and the output text. Only set alongside `executionSite: 'client'`.
+   */
+  usageEstimated?: boolean;
+  /**
    * Agent Run operation id this verify card belongs to (for role='verify' messages).
    * References `agent_operations.id`; the card reads the verify plan + results off it.
    */
   verifyOperationId?: string;
   /** Display round number for the verify card (1-based; repair rounds are separate). */
   verifyRound?: number;
+  /**
+   * Final assistant message marker for Work artifacts produced during one root
+   * operation. Work ownership stays on `work_versions.root_operation_id`; this
+   * metadata only tells refreshed chat history where to render the cards.
+   */
+  work?: MessageWorkMetadata;
+}
+
+export interface MessageWorkMetadata {
+  rootOperationId: string;
+  userMessageId?: string;
+}
+
+/**
+ * Pointer carried on a `role='taskCallback'` message — the result-bridge card
+ * that reports a finished task's handoff back to its creator conversation
+ * The handoff summary itself lives in the message `content`; this
+ * pointer drives the card header (identifier + outcome) and the jump link.
+ */
+export interface MessageTaskCallback {
+  /** Task identifier (e.g. `T-42`) for the card header + jump link. */
+  identifier: string;
+  /** Terminal outcome of the task run that produced this callback. */
+  reason: 'done' | 'error' | 'interrupted';
+  /** The task id (jump target → task detail). */
+  taskId: string;
+  /** The completed task topic, for an optional "view run" link. */
+  topicId?: string;
 }
 
 /**

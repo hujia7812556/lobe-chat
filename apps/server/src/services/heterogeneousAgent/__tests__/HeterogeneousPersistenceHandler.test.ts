@@ -1,5 +1,6 @@
 // @vitest-environment node
 import type { AgentStreamEvent } from '@lobechat/agent-gateway-client';
+import { createAdapter } from '@lobechat/heterogeneous-agents';
 import { ThreadStatus } from '@lobechat/types';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -40,9 +41,10 @@ interface FakeThread {
 
 interface FakeTopicMetadata {
   heteroCurrentMsgId?: { msgId: string; operationId: string };
-  runningOperation: {
+  runningOperation?: {
     assistantMessageId: string;
     operationId: string;
+    threadId?: string;
   };
 }
 
@@ -53,10 +55,14 @@ interface FakeTopic {
 }
 
 const createHarness = (params: {
+  assistantAgentId?: string | null;
   assistantMessageId: string;
+  /** Stands in for the operation row: is this run still live on this topic? */
+  isOperationLiveOnTopic?: (operationId: string, topicId: string) => Promise<boolean>;
   operationId: string;
   topicAgentId?: string | null;
   topicId: string;
+  threadId?: string;
 }) => {
   let nextMsgIdSeq = 0;
   const messages = new Map<string, FakeMessage>();
@@ -65,10 +71,11 @@ const createHarness = (params: {
   // Seed the initial assistant message that the orchestrator would have
   // created before triggering the CLI ingest.
   messages.set(params.assistantMessageId, {
-    agentId: params.topicAgentId ?? null,
+    agentId: params.assistantAgentId ?? params.topicAgentId ?? null,
     content: '',
     id: params.assistantMessageId,
     role: 'assistant',
+    threadId: params.threadId ?? null,
     topicId: params.topicId,
   });
 
@@ -117,14 +124,17 @@ const createHarness = (params: {
       },
     ),
     findById: vi.fn(async (id: string) => messages.get(id) ?? null),
-    getLastMainThreadSpineMessageId: vi.fn(async (_topicId: string) => {
-      // Mirror the SQL: most recent main-agent (threadId null) message that is
-      // NOT a tool and NOT a signal-tagged callback. Insertion order == creation.
-      const match = [...messages.values()].findLast(
-        (m) => m.role !== 'tool' && !m.threadId && !(m as any).metadata?.signal,
-      );
-      return match?.id;
-    }),
+    getLatestSpineMessageId: vi.fn(
+      async ({ threadId }: { threadId?: string | null; topicId: string }) => {
+        const match = [...messages.values()].findLast(
+          (m) =>
+            m.role !== 'tool' &&
+            (m.threadId ?? null) === (threadId ?? null) &&
+            !(m as any).metadata?.signal,
+        );
+        return match?.id;
+      },
+    ),
     listMessagePluginsByTopic: vi.fn(async (_topicId: string) => []),
   };
 
@@ -160,6 +170,7 @@ const createHarness = (params: {
           runningOperation: {
             assistantMessageId: params.assistantMessageId,
             operationId: params.operationId,
+            threadId: params.threadId,
           },
         } satisfies FakeTopicMetadata,
       };
@@ -168,6 +179,7 @@ const createHarness = (params: {
   };
 
   const handler = new HeterogeneousPersistenceHandler({
+    isOperationLiveOnTopic: params.isOperationLiveOnTopic,
     messageModel: messageModel as any,
     threadModel: threadModel as any,
     topicModel: topicModel as any,
@@ -269,6 +281,112 @@ describe('HeterogeneousPersistenceHandler', () => {
       ).rejects.toThrow(/no active runningOperation/);
     });
 
+    it('keeps persisting when the marker is gone but the operation is still running', async () => {
+      // The marker is a rendering pointer any client can settle — a transport
+      // signal (a raw session_complete, or one multiplexed socket failing auth
+      // for every operation on the tab) clears it while the CLI keeps
+      // streaming. Refusing here discards the rest of a live run's output.
+      const isOperationLiveOnTopic = vi.fn(async () => true);
+      const h = createHarness({
+        assistantMessageId: 'asst-1',
+        isOperationLiveOnTopic,
+        operationId: 'op-1',
+        topicId: 'topic-1',
+      });
+      h.topicModel.findById.mockResolvedValueOnce({
+        agentId: null,
+        id: 'topic-1',
+        metadata: {} as any,
+      });
+
+      await h.handler.ingest({
+        assistantMessageId: 'asst-1',
+        events: [buildEvent('stream_chunk', 0, { chunkType: 'text', content: 'kept' })],
+        operationId: 'op-1',
+        topicId: 'topic-1',
+      });
+
+      expect(isOperationLiveOnTopic).toHaveBeenCalledWith('op-1', 'topic-1');
+      expect(h.messageModel.update).toHaveBeenCalledWith('asst-1', { content: 'kept' });
+    });
+
+    it('recovers the assistant pointer from heteroCurrentMsgId when the marker is gone', async () => {
+      // Desktop / old-CLI callers forward no assistantMessageId, so once the
+      // marker is gone the operation-scoped `heteroCurrentMsgId` is the only
+      // pointer left to the turn in flight.
+      const h = createHarness({
+        assistantMessageId: 'asst-1',
+        isOperationLiveOnTopic: async () => true,
+        operationId: 'op-1',
+        topicId: 'topic-1',
+      });
+      h.topicModel.findById.mockResolvedValueOnce({
+        agentId: null,
+        id: 'topic-1',
+        metadata: { heteroCurrentMsgId: { msgId: 'asst-1', operationId: 'op-1' } } as any,
+      });
+
+      await h.handler.ingest({
+        events: [buildEvent('stream_chunk', 0, { chunkType: 'text', content: 'kept' })],
+        operationId: 'op-1',
+        topicId: 'topic-1',
+      });
+
+      expect(h.messageModel.update).toHaveBeenCalledWith('asst-1', { content: 'kept' });
+    });
+
+    it('still refuses a marker-less batch once the operation row is terminal', async () => {
+      const h = createHarness({
+        assistantMessageId: 'asst-1',
+        isOperationLiveOnTopic: async () => false,
+        operationId: 'op-1',
+        topicId: 'topic-1',
+      });
+      h.topicModel.findById.mockResolvedValueOnce({
+        agentId: null,
+        id: 'topic-1',
+        metadata: {} as any,
+      });
+
+      await expect(
+        h.handler.ingest({
+          assistantMessageId: 'asst-1',
+          events: [buildEvent('stream_chunk', 0, { chunkType: 'text', content: 'x' })],
+          operationId: 'op-1',
+          topicId: 'topic-1',
+        }),
+      ).rejects.toThrow(/no active runningOperation/);
+    });
+
+    it('refuses a superseded batch even while its own operation row is alive', async () => {
+      // Liveness must NOT override ownership: a marker naming another run means
+      // the topic has moved on, and writing here would mutate a newer turn.
+      const isOperationLiveOnTopic = vi.fn(async () => true);
+      const h = createHarness({
+        assistantMessageId: 'asst-1',
+        isOperationLiveOnTopic,
+        operationId: 'op-1',
+        topicId: 'topic-1',
+      });
+      h.topicModel.findById.mockResolvedValueOnce({
+        agentId: null,
+        id: 'topic-1',
+        metadata: {
+          runningOperation: { assistantMessageId: 'asst-other', operationId: 'op-OTHER' },
+        },
+      });
+
+      await expect(
+        h.handler.ingest({
+          assistantMessageId: 'asst-1',
+          events: [buildEvent('stream_chunk', 0, { chunkType: 'text', content: 'x' })],
+          operationId: 'op-1',
+          topicId: 'topic-1',
+        }),
+      ).rejects.toThrow(/current operation is op-OTHER/);
+      expect(isOperationLiveOnTopic).not.toHaveBeenCalled();
+    });
+
     it('validates seeded assistant ids belong to the current topic', async () => {
       const h = createHarness({
         assistantMessageId: 'asst-1',
@@ -361,6 +479,53 @@ describe('HeterogeneousPersistenceHandler', () => {
       expect(asst.metadata?.heteroTextSnapshotSeq).toBe(2);
     });
 
+    it('replaces reasoning snapshots idempotently instead of re-appending on redelivery', async () => {
+      const h = createHarness({
+        assistantMessageId: 'asst-1',
+        operationId: 'op-1',
+        topicId: 'topic-1',
+      });
+
+      await h.handler.ingest({
+        events: [
+          buildEvent('stream_chunk', 0, {
+            chunkType: 'reasoning',
+            reasoning: 'thinking hard',
+            snapshotMode: 'replace',
+            snapshotSeq: 1,
+          }),
+        ],
+        operationId: 'op-1',
+        topicId: 'topic-1',
+      });
+
+      // Redelivery reaching the reducer (a cold replica has an empty
+      // processedKeys map — simulated here with a different timestamp so the
+      // in-memory dedupe does not swallow the event first). A raw delta would
+      // re-append and durably double the reasoning; the snapshot must not.
+      await h.handler.ingest({
+        events: [
+          buildEvent(
+            'stream_chunk',
+            0,
+            {
+              chunkType: 'reasoning',
+              reasoning: 'thinking hard',
+              snapshotMode: 'replace',
+              snapshotSeq: 1,
+            },
+            1_700_000_000_999,
+          ),
+        ],
+        operationId: 'op-1',
+        topicId: 'topic-1',
+      });
+
+      const asst = h.messages.get('asst-1')!;
+      expect(asst.reasoning?.content).toBe('thinking hard'); // NOT doubled
+      expect(asst.metadata?.heteroReasoningSnapshotSeq).toBe(1);
+    });
+
     it('drops events with the same (stepIndex, type, timestamp, dataFingerprint) key', async () => {
       const h = createHarness({
         assistantMessageId: 'asst-1',
@@ -389,6 +554,35 @@ describe('HeterogeneousPersistenceHandler', () => {
 
       // Same event re-ingested → idempotency skips it; no extra tool-message create
       expect(h.messageModel.create.mock.calls.length).toBe(createCallsAfterFirst);
+    });
+
+    it('gates publishing per operation and releases the gate when the operation finishes', async () => {
+      const h = createHarness({
+        assistantMessageId: 'asst-1',
+        operationId: 'op-1',
+        topicId: 'topic-1',
+      });
+      const first = buildEvent('stream_chunk', 0, { chunkType: 'text', content: 'x' });
+      const second = buildEvent('stream_chunk', 1, { chunkType: 'text', content: 'y' });
+
+      // Without operation state (nothing ingested yet, or a cold replica):
+      // treat everything as unpublished and latch nothing — degraded
+      // republish-all rather than silently dropping events.
+      expect(h.handler.filterUnpublishedEvents('op-1', [first, second])).toEqual([first, second]);
+      h.handler.markEventPublished('op-1', first);
+      expect(h.handler.filterUnpublishedEvents('op-1', [first, second])).toEqual([first, second]);
+
+      await h.handler.ingest({ events: [first, second], operationId: 'op-1', topicId: 'topic-1' });
+
+      // Latch per event: only unlatched events remain.
+      h.handler.markEventPublished('op-1', first);
+      expect(h.handler.filterUnpublishedEvents('op-1', [first, second])).toEqual([second]);
+      h.handler.markEventPublished('op-1', second);
+      expect(h.handler.filterUnpublishedEvents('op-1', [first, second])).toEqual([]);
+
+      // finish() drops the per-operation state — the gate goes with it.
+      await h.handler.finish({ operationId: 'op-1', result: 'success' });
+      expect(h.handler.filterUnpublishedEvents('op-1', [first, second])).toEqual([first, second]);
     });
 
     it('does NOT collide bursty events sharing (stepIndex, type, timestamp) when their data differs', async () => {
@@ -468,6 +662,52 @@ describe('HeterogeneousPersistenceHandler', () => {
   });
 
   describe('3-phase tool persist (main agent)', () => {
+    it('keeps tool rows and post-tool assistants attributed to the direct target agent', async () => {
+      const h = createHarness({
+        assistantAgentId: 'agent-direct-target',
+        assistantMessageId: 'asst-1',
+        operationId: 'op-1',
+        topicAgentId: 'agent-conversation-owner',
+        topicId: 'topic-1',
+      });
+
+      const tool = {
+        apiName: 'Read',
+        arguments: '{"file_path":"tool-proof.txt"}',
+        id: 'tc-1',
+        identifier: 'claude-code',
+        type: 'default' as const,
+      };
+
+      await h.handler.ingest({
+        events: [
+          buildEvent('stream_chunk', 0, { chunkType: 'tools_calling', toolsCalling: [tool] }),
+          buildEvent('tool_result', 1, {
+            content: 'TOOL_CALL_MARKER',
+            isError: false,
+            toolCallId: 'tc-1',
+          }),
+          buildEvent('stream_start', 2, { newStep: true }),
+          buildEvent('stream_chunk', 3, {
+            chunkType: 'text',
+            content: 'TOOL_CALL_MARKER',
+          }),
+        ],
+        operationId: 'op-1',
+        topicId: 'topic-1',
+      });
+
+      const toolMessage = [...h.messages.values()].find((message) => message.role === 'tool');
+      const finalAssistant = [...h.messages.values()].find(
+        (message) => message.role === 'assistant' && message.id !== 'asst-1',
+      );
+
+      expect(toolMessage?.agentId).toBe('agent-direct-target');
+      expect(finalAssistant?.agentId).toBe('agent-direct-target');
+      expect(finalAssistant?.parentId).toBe('asst-1');
+      expect(finalAssistant?.content).toBe('TOOL_CALL_MARKER');
+    });
+
     it('writes assistant.tools[] then tool message then backfilled result_msg_id in order', async () => {
       const h = createHarness({
         assistantMessageId: 'asst-1',
@@ -561,6 +801,41 @@ describe('HeterogeneousPersistenceHandler', () => {
   });
 
   describe('step boundaries (stream_start newStep)', () => {
+    it('recovers an isolation run from the thread spine instead of the projected topic reply', async () => {
+      const h = createHarness({
+        assistantMessageId: 'thread-asst-1',
+        operationId: 'op-1',
+        threadId: 'thread-1',
+        topicId: 'topic-1',
+      });
+      h.messages.set('projected-topic-reply', {
+        agentId: 'target-agent',
+        content: 'projected answer',
+        id: 'projected-topic-reply',
+        role: 'assistant',
+        threadId: null,
+        topicId: 'topic-1',
+      });
+
+      await h.handler.ingest({
+        events: [buildEvent('stream_start', 1, { newStep: true })],
+        operationId: 'op-1',
+        topicId: 'topic-1',
+      });
+
+      const nextThreadAssistant = [...h.messages.values()].find(
+        (message) =>
+          message.role === 'assistant' &&
+          message.threadId === 'thread-1' &&
+          message.id !== 'thread-asst-1',
+      );
+      expect(nextThreadAssistant?.parentId).toBe('thread-asst-1');
+      expect(h.messageModel.getLatestSpineMessageId).toHaveBeenCalledWith({
+        threadId: 'thread-1',
+        topicId: 'topic-1',
+      });
+    });
+
     it('flushes prior content, opens a new assistant chained off the prior assistant (spine)', async () => {
       const h = createHarness({
         assistantMessageId: 'asst-1',
@@ -604,7 +879,7 @@ describe('HeterogeneousPersistenceHandler', () => {
 
     it('chains off the prior assistant (spine) across a multi-replica boundary, recovered from DB', async () => {
       // Phase 2: the chain parent is the run's latest non-tool / non-signal
-      // main message, recovered from the DB (`getLastMainThreadSpineMessageId`)
+      // scoped message, recovered from the DB (`getLatestSpineMessageId`)
       // independent of the in-memory current-assistant pointer. So even when the
       // prior step's tools_calling drained on a DIFFERENT replica (this replica's
       // toolState stays empty), step 2 still chains off step 1's assistant — a
@@ -1223,6 +1498,143 @@ describe('HeterogeneousPersistenceHandler', () => {
       expect(asst.content).toBe('final answer');
     });
 
+    /**
+     * @example A finish request on a stale replica preserves the final snapshot written elsewhere.
+     */
+    it('does not let a stale finish overwrite a newer assistant snapshot', async () => {
+      // ROOT CAUSE:
+      //
+      // A warm serverless replica can retain an older per-operation accumulator
+      // while another replica persists a newer text snapshot to the shared DB.
+      // Before the fix, heteroFinish flushed the stale accumulator and replaced
+      // the final answer with the preceding progress message.
+      //
+      // We fixed this by making heteroIngest the only content/reasoning writer;
+      // a successful finish now releases operation state without rewriting text.
+      const h = createHarness({
+        assistantMessageId: 'asst-1',
+        operationId: 'op-1',
+        topicId: 'topic-1',
+      });
+
+      await h.handler.ingest({
+        events: [
+          buildEvent('stream_chunk', 0, {
+            chunkType: 'text',
+            content: 'progress',
+            snapshotMode: 'replace',
+            snapshotSeq: 4,
+          }),
+        ],
+        operationId: 'op-1',
+        topicId: 'topic-1',
+      });
+
+      // Simulate a newer snapshot committed by another Lambda replica.
+      h.messages.set('asst-1', {
+        ...h.messages.get('asst-1')!,
+        content: 'progress\n\nfinal answer',
+        metadata: { heteroTextSnapshotSeq: 5 },
+      });
+
+      await h.handler.finish({
+        operationId: 'op-1',
+        result: 'success',
+        topicId: 'topic-1',
+      });
+
+      expect(h.messages.get('asst-1')).toMatchObject({
+        content: 'progress\n\nfinal answer',
+        metadata: { heteroTextSnapshotSeq: 5 },
+      });
+    });
+
+    it.each([false, true])(
+      'does not persist a Codex reconnect on either side of a tool-created step (failed=%s)',
+      async (failed) => {
+        const h = createHarness({
+          assistantMessageId: 'asst-1',
+          operationId: 'op-1',
+          topicId: 'topic-1',
+        });
+        const adapter = createAdapter('codex');
+        const rawEvents = [
+          { type: 'turn.started' },
+          { message: 'Reconnecting... 2/5 (request timed out)', type: 'error' },
+          {
+            item: { id: 'progress', text: 'Inspecting the workflow.', type: 'agent_message' },
+            type: 'item.completed',
+          },
+          {
+            item: { command: 'printf inspected', id: 'inspect', type: 'command_execution' },
+            type: 'item.started',
+          },
+          {
+            item: {
+              aggregated_output: 'inspected',
+              command: 'printf inspected',
+              exit_code: 0,
+              id: 'inspect',
+              status: 'completed',
+              type: 'command_execution',
+            },
+            type: 'item.completed',
+          },
+          {
+            item: {
+              id: 'answer',
+              text: 'Version checks do not publish releases.',
+              type: 'agent_message',
+            },
+            type: 'item.completed',
+          },
+          failed
+            ? { error: { message: 'stream closed before response.completed' }, type: 'turn.failed' }
+            : { type: 'turn.completed' },
+        ];
+        // Keep ingest batches separated across the error/tool/newStep boundaries.
+        // Mock only the database, not the adapter or persistence coordinator.
+        let timestamp = 1_700_000_000_000;
+        for (const raw of rawEvents) {
+          const events = adapter.adapt(raw);
+          if (events.length === 0) continue;
+          await h.handler.ingest({
+            events: events.map((event) =>
+              buildEvent(event.type, event.stepIndex, event.data, timestamp++),
+            ),
+            operationId: 'op-1',
+            topicId: 'topic-1',
+          });
+        }
+        await h.handler.finish({
+          error: failed
+            ? { message: 'stream closed before response.completed', type: 'AgentRuntimeError' }
+            : undefined,
+          operationId: 'op-1',
+          result: failed ? 'error' : 'success',
+          topicId: 'topic-1',
+        });
+
+        const assistants = [...h.messages.values()].filter(
+          (message) => message.role === 'assistant',
+        );
+        expect(assistants).toHaveLength(2);
+        expect(assistants.map((message) => message.content)).toEqual([
+          'Inspecting the workflow.',
+          'Version checks do not publish releases.',
+        ]);
+        expect(assistants[0].error).toBeUndefined();
+        expect(assistants.filter((message) => message.error)).toHaveLength(failed ? 1 : 0);
+        if (failed) {
+          expect(assistants[1].error.message).toBe('stream closed before response.completed');
+        }
+        expect([...h.messages.values()].find((message) => message.role === 'tool')).toMatchObject({
+          content: 'inspected',
+          parentId: 'asst-1',
+        });
+      },
+    );
+
     it('writes error onto the assistant when terminal event is error', async () => {
       const h = createHarness({
         assistantMessageId: 'asst-1',
@@ -1246,6 +1658,241 @@ describe('HeterogeneousPersistenceHandler', () => {
       expect(asst.error).toBeDefined();
       expect(asst.error.message).toBe('CLI auth required');
       expect(asst.content).toBe('partial');
+    });
+
+    it('finish() preserves a structured status-guide error body on the assistant', async () => {
+      const h = createHarness({
+        assistantMessageId: 'asst-1',
+        operationId: 'op-1',
+        topicId: 'topic-1',
+      });
+
+      // Register op state without any in-stream error — the process-level
+      // failure (spawn ENOENT) only arrives via the finish payload.
+      await h.handler.ingest({
+        events: [buildEvent('stream_chunk', 0, { chunkType: 'text', content: '' })],
+        operationId: 'op-1',
+        topicId: 'topic-1',
+      });
+
+      await h.handler.finish({
+        error: {
+          body: {
+            agentType: 'claude-code',
+            code: 'cli_not_found',
+            stderr: 'Error: spawn claude ENOENT',
+          },
+          message: 'Claude Code CLI was not found on the machine running this agent.',
+          type: 'stream_error',
+        },
+        operationId: 'op-1',
+        result: 'error',
+      });
+
+      const asst = h.messages.get('asst-1')!;
+      expect(asst.error).toBeDefined();
+      // `body` must survive formatErrorForState untouched — the client's
+      // status-guide UI gates on `body.agentType` + `body.code`.
+      expect(asst.error.body).toMatchObject({
+        agentType: 'claude-code',
+        code: 'cli_not_found',
+        stderr: 'Error: spawn claude ENOENT',
+      });
+      expect(asst.error.message).toContain('was not found');
+    });
+
+    it('finish() must not downgrade an in-stream status-guide error with a flat message', async () => {
+      // Remote CC relays an API failure (529 overloaded / rate limit) as an
+      // in-stream `error` event whose data the adapter already classified into
+      // the structured status-guide shape (`agentType` + `code`). Older CLIs
+      // then send a finish error flattened to a bare `{ message }` — writing
+      // that over the persisted structured error would demote the client from
+      // the dedicated guide card to the generic error alert.
+      const h = createHarness({
+        assistantMessageId: 'asst-1',
+        operationId: 'op-1',
+        topicId: 'topic-1',
+      });
+
+      const overloadedMessage = 'API Error: 529 Overloaded. This is a server-side issue.';
+      await h.handler.ingest({
+        events: [
+          buildEvent('error', 0, {
+            agentType: 'claude-code',
+            code: 'overloaded',
+            error: overloadedMessage,
+            message: overloadedMessage,
+            stderr: overloadedMessage,
+          }),
+        ],
+        operationId: 'op-1',
+        topicId: 'topic-1',
+      });
+
+      await h.handler.finish({
+        error: { message: overloadedMessage, type: 'AgentRuntimeError' },
+        operationId: 'op-1',
+        result: 'error',
+      });
+
+      const asst = h.messages.get('asst-1')!;
+      expect(asst.error.body).toMatchObject({
+        agentType: 'claude-code',
+        code: 'overloaded',
+      });
+    });
+
+    it('finish() with NO prior ingest bootstraps state and writes the error (spawn-fail path)', async () => {
+      // The real process-level failure shape: spawn ENOENT produces ZERO
+      // stream events, so no ingest ever created an OperationState. finish()
+      // must bootstrap from topic.metadata.runningOperation and write the
+      // error itself — deferring it to CompletionLifecycle (which runs AFTER
+      // the agent_runtime_end publish) races the client's message refetch.
+      const h = createHarness({
+        assistantMessageId: 'asst-1',
+        operationId: 'op-1',
+        topicId: 'topic-1',
+      });
+
+      await h.handler.finish({
+        error: {
+          body: {
+            agentType: 'claude-code',
+            code: 'cli_not_found',
+            stderr: 'Error: spawn claude ENOENT',
+          },
+          message: 'Claude Code CLI was not found on the machine running this agent.',
+          type: 'AgentRuntimeError',
+        },
+        operationId: 'op-1',
+        result: 'error',
+        topicId: 'topic-1',
+      });
+
+      const asst = h.messages.get('asst-1')!;
+      expect(asst.error).toBeDefined();
+      expect(asst.error.body).toMatchObject({
+        agentType: 'claude-code',
+        code: 'cli_not_found',
+      });
+      expect(asst.error.message).toContain('was not found');
+    });
+
+    it('finish() projects the terminal error by assistant id after runningOperation was cleared', async () => {
+      // Gateway session completion can clear runningOperation before the CLI's
+      // heteroFinish request arrives. The producer-carried assistant id must
+      // keep that race from leaving an empty assistant with error=null.
+      const h = createHarness({
+        assistantMessageId: 'asst-1',
+        operationId: 'op-1',
+        topicId: 'topic-1',
+      });
+      // The CLI echoed the failure into the answer before reporting it — that
+      // echo is what `clearEchoedContent` drops.
+      h.messages.get('asst-1')!.content = "You've hit your session limit";
+      h.topicModel.findById.mockResolvedValue({
+        agentId: null,
+        id: 'topic-1',
+        metadata: {},
+      });
+
+      await h.handler.finish({
+        assistantMessageId: 'asst-1',
+        error: {
+          body: {
+            agentType: 'claude-code',
+            clearEchoedContent: true,
+            code: 'rate_limit',
+            details: { kind: 'usage_limit' },
+          },
+          message: "You've hit your session limit",
+          type: 'AgentRuntimeError',
+        },
+        operationId: 'op-1',
+        result: 'error',
+        topicId: 'topic-1',
+      });
+
+      const asst = h.messages.get('asst-1')!;
+      expect(asst.error).toMatchObject({
+        body: {
+          agentType: 'claude-code',
+          code: 'rate_limit',
+        },
+        message: "You've hit your session limit",
+        type: 'AgentRuntimeError',
+      });
+      expect(asst.content).toBe('');
+    });
+
+    it('finish() keeps real work when a quota error only marks an echo', async () => {
+      // Kimi Code can burn a full run and only then hit its weekly window. The
+      // finish error carries clearEchoedContent (every rate_limit does), but
+      // the streamed answer is not an echo of it and must survive.
+      const h = createHarness({
+        assistantMessageId: 'asst-1',
+        operationId: 'op-1',
+        topicId: 'topic-1',
+      });
+      h.messages.get('asst-1')!.content = 'Refactored the adapter and ran the tests.';
+      h.topicModel.findById.mockResolvedValue({
+        agentId: null,
+        id: 'topic-1',
+        metadata: {},
+      });
+
+      await h.handler.finish({
+        assistantMessageId: 'asst-1',
+        error: {
+          body: {
+            agentType: 'kimi-code',
+            clearEchoedContent: true,
+            code: 'rate_limit',
+            details: { kind: 'usage_limit' },
+          },
+          message: "You've reached your weekly (7-day) usage limit.",
+          type: 'AgentRuntimeError',
+        },
+        operationId: 'op-1',
+        result: 'error',
+        topicId: 'topic-1',
+      });
+
+      const asst = h.messages.get('asst-1')!;
+      expect(asst.content).toBe('Refactored the adapter and ran the tests.');
+      expect(asst.error).toMatchObject({ body: { agentType: 'kimi-code', code: 'rate_limit' } });
+    });
+
+    it('finish() with no state stays a no-op for a stale operation (mismatched runningOperation)', async () => {
+      const h = createHarness({
+        assistantMessageId: 'asst-1',
+        operationId: 'op-1',
+        topicId: 'topic-1',
+      });
+      // The topic's runningOperation belongs to a DIFFERENT operation — a late
+      // finish from a superseded run must not touch the current turn.
+      h.topicModel.findById.mockResolvedValueOnce({
+        agentId: null,
+        id: 'topic-1',
+        metadata: {
+          runningOperation: {
+            assistantMessageId: 'asst-other',
+            operationId: 'op-OTHER',
+          },
+        },
+      });
+
+      await expect(
+        h.handler.finish({
+          error: { message: 'boom', type: 'AgentRuntimeError' },
+          operationId: 'op-1',
+          result: 'error',
+          topicId: 'topic-1',
+        }),
+      ).resolves.toBeUndefined();
+
+      expect(h.messages.get('asst-1')!.error).toBeUndefined();
+      expect(h.messageModel.update).not.toHaveBeenCalled();
     });
 
     it('finish() drops the per-operation state so a retry starts fresh', async () => {
@@ -1400,6 +2047,29 @@ describe('HeterogeneousPersistenceHandler', () => {
   });
 
   describe('warm replica step resync', () => {
+    it('reports a late advanced batch as stale after its operation was removed', async () => {
+      const h = createHarness({
+        assistantMessageId: 'asst-1',
+        operationId: 'op-1',
+        topicId: 'topic-1',
+      });
+
+      await h.handler.ingest({
+        events: [buildEvent('stream_chunk', 0, { chunkType: 'text', content: 'step1' })],
+        operationId: 'op-1',
+        topicId: 'topic-1',
+      });
+      h.topicModel.findById.mockResolvedValue({ agentId: null, id: 'topic-1', metadata: {} });
+
+      await expect(
+        h.handler.ingest({
+          events: [buildEvent('stream_chunk', 1, { chunkType: 'text', content: 'late' })],
+          operationId: 'op-1',
+          topicId: 'topic-1',
+        }),
+      ).rejects.toThrow('Stale hetero operation op-1');
+    });
+
     it('switches to the DB-persisted step assistant when a later-step batch lands on a stale warm replica', async () => {
       const h = createHarness({
         assistantMessageId: 'asst-1',
@@ -1442,6 +2112,217 @@ describe('HeterogeneousPersistenceHandler', () => {
 
       expect(h.messages.get('asst-1')?.content).toBe('step1');
       expect(h.messages.get('asst-2')?.content).toBe('step2');
+    });
+  });
+
+  describe('per-message session provenance (heteroSessionId / heteroMessageId)', () => {
+    it('stamps the CC session id + turn message id on the assistant, its tools, and its usage', async () => {
+      const h = createHarness({
+        assistantMessageId: 'asst-init',
+        operationId: 'op-1',
+        topicId: 'topic-1',
+      });
+
+      const tool = {
+        apiName: 'Bash',
+        arguments: '{}',
+        id: 'tc-1',
+        identifier: 'bash',
+        type: 'default',
+      };
+
+      await h.handler.ingest({
+        events: [
+          // system.init: carries the CC session id but opens no new assistant.
+          buildEvent('stream_start', 0, { sessionId: 'sess-A' }),
+          // A real turn boundary: opens a new assistant for CC message cc-1.
+          buildEvent('stream_start', 1, {
+            messageId: 'cc-1',
+            newStep: true,
+            sessionId: 'sess-A',
+          }),
+          buildEvent('stream_chunk', 2, { chunkType: 'tools_calling', toolsCalling: [tool] }),
+          buildEvent('step_complete', 3, {
+            phase: 'turn_metadata',
+            usage: { totalInputTokens: 1, totalOutputTokens: 1, totalTokens: 2 },
+          }),
+        ],
+        operationId: 'op-1',
+        topicId: 'topic-1',
+      });
+
+      const assistant = [...h.messages.values()].find(
+        (m) => m.role === 'assistant' && m.id !== 'asst-init',
+      )!;
+      expect(assistant.metadata).toMatchObject({
+        heteroMessageId: 'cc-1',
+        heteroSessionId: 'sess-A',
+      });
+
+      const toolRow = [...h.messages.values()].find((m) => m.role === 'tool')!;
+      expect(toolRow.metadata).toMatchObject({
+        heteroMessageId: 'cc-1',
+        heteroSessionId: 'sess-A',
+      });
+
+      // recordUsage overwrites the row's metadata wholesale — provenance must survive.
+      const usageWrite = h.messageModel.update.mock.calls.find(
+        ([, patch]: [string, any]) => patch?.metadata?.usage,
+      )!;
+      expect(usageWrite[1].metadata).toMatchObject({
+        heteroMessageId: 'cc-1',
+        heteroSessionId: 'sess-A',
+        usage: { totalTokens: 2 },
+      });
+    });
+
+    it('records a mid-topic session fork per-message so a diff pinpoints the break', async () => {
+      // The tpc_PZAmvtpkfHE1 scenario: `--resume` failed, CC opened a fresh
+      // session mid-conversation, and the topic-level single heteroSessionId
+      // could not show WHERE the history was lost. Per-message stamping does.
+      const h = createHarness({
+        assistantMessageId: 'asst-init',
+        operationId: 'op-1',
+        topicId: 'topic-1',
+      });
+
+      await h.handler.ingest({
+        events: [
+          buildEvent('stream_start', 0, { sessionId: 'sess-A' }),
+          buildEvent('stream_start', 1, { messageId: 'cc-1', newStep: true, sessionId: 'sess-A' }),
+          buildEvent('stream_chunk', 2, { chunkType: 'text', content: 'turn 1' }),
+          // Next turn resumes into a DIFFERENT session — the fork.
+          buildEvent('stream_start', 3, { messageId: 'cc-2', newStep: true, sessionId: 'sess-B' }),
+          buildEvent('stream_chunk', 4, { chunkType: 'text', content: 'turn 2' }),
+        ],
+        operationId: 'op-1',
+        topicId: 'topic-1',
+      });
+
+      const newAssistants = [...h.messages.values()].filter(
+        (m) => m.role === 'assistant' && m.id !== 'asst-init',
+      );
+      const sessById = new Map(
+        newAssistants.map((m) => [m.metadata?.heteroMessageId, m.metadata?.heteroSessionId]),
+      );
+      expect(sessById.get('cc-1')).toBe('sess-A');
+      expect(sessById.get('cc-2')).toBe('sess-B');
+    });
+
+    it('stamps heteroMessageId on the FIRST (seeded) turn, not just later newStep turns', async () => {
+      // The first CC assistant follows system:init with NO newStep — it lands on
+      // the pre-seeded assistant. The adapter now carries the turn's message.id on
+      // that non-newStep stream_start so the seed assistant + its first-turn tool
+      // and usage rows get heteroMessageId — the common first turn of a
+      // resumed/forked operation this forensic data exists to diagnose.
+      const h = createHarness({
+        assistantMessageId: 'asst-init',
+        operationId: 'op-1',
+        topicId: 'topic-1',
+      });
+
+      const tool = {
+        apiName: 'Bash',
+        arguments: '{}',
+        id: 'tc-1',
+        identifier: 'bash',
+        type: 'default',
+      };
+
+      await h.handler.ingest({
+        events: [
+          // system:init carries the session id but opens no new assistant.
+          buildEvent('stream_start', 0, { sessionId: 'sess-A' }),
+          // First assistant after init: non-newStep stream_start carrying the
+          // seed turn's CC message.id (what the adapter now emits).
+          buildEvent('stream_start', 1, { messageId: 'cc-seed', sessionId: 'sess-A' }),
+          buildEvent('stream_chunk', 2, { chunkType: 'tools_calling', toolsCalling: [tool] }),
+          buildEvent('step_complete', 3, {
+            phase: 'turn_metadata',
+            usage: { totalInputTokens: 1, totalOutputTokens: 1, totalTokens: 2 },
+          }),
+        ],
+        operationId: 'op-1',
+        topicId: 'topic-1',
+      });
+
+      // The seeded assistant's usage write re-stamps the provenance.
+      const seedUsageWrite = h.messageModel.update.mock.calls.find(
+        ([id, patch]: [string, any]) => id === 'asst-init' && patch?.metadata?.usage,
+      )!;
+      expect(seedUsageWrite[1].metadata).toMatchObject({
+        heteroMessageId: 'cc-seed',
+        heteroSessionId: 'sess-A',
+      });
+
+      const toolRow = [...h.messages.values()].find((m) => m.role === 'tool')!;
+      expect(toolRow.metadata).toMatchObject({
+        heteroMessageId: 'cc-seed',
+        heteroSessionId: 'sess-A',
+      });
+    });
+
+    it('stamps the subagent turn message id on subagent tool + usage rows', async () => {
+      const h = createHarness({
+        assistantMessageId: 'asst-init',
+        operationId: 'op-1',
+        topicId: 'topic-1',
+      });
+
+      const subagentCtx = {
+        parentToolCallId: 'tc-spawn',
+        spawnMetadata: { prompt: 'p', subagentType: 'Explore' },
+        subagentMessageId: 'sub-1',
+      };
+
+      await h.handler.ingest({
+        events: [
+          buildEvent('stream_start', 0, { sessionId: 'sess-A' }),
+          buildEvent('stream_chunk', 1, {
+            chunkType: 'tools_calling',
+            subagent: subagentCtx,
+            toolsCalling: [
+              {
+                apiName: 'Read',
+                arguments: '{}',
+                id: 'inner-tc',
+                identifier: 'read',
+                type: 'default',
+              },
+            ],
+          }),
+          buildEvent('step_complete', 2, {
+            phase: 'turn_metadata',
+            subagent: subagentCtx,
+            usage: { totalInputTokens: 1, totalOutputTokens: 1, totalTokens: 2 },
+          }),
+          buildEvent('agent_runtime_end', 3, { reason: 'success' }),
+        ],
+        operationId: 'op-1',
+        topicId: 'topic-1',
+      });
+
+      const threadId = [...h.threads.keys()][0];
+
+      // The subagent's inner tool row carries the subagent turn's message id.
+      const innerTool = [...h.messages.values()].find(
+        (m) => m.threadId === threadId && m.role === 'tool',
+      )!;
+      expect(innerTool.metadata).toMatchObject({
+        heteroMessageId: 'sub-1',
+        heteroSessionId: 'sess-A',
+      });
+
+      // recordUsage overwrites the subagent assistant's metadata wholesale — the
+      // heteroMessageId createMessage stamped must survive it.
+      const subUsageWrite = h.messageModel.update.mock.calls.find(
+        ([, patch]: [string, any]) => patch?.metadata?.usage,
+      )!;
+      expect(subUsageWrite[1].metadata).toMatchObject({
+        heteroMessageId: 'sub-1',
+        heteroSessionId: 'sess-A',
+        usage: { totalTokens: 2 },
+      });
     });
   });
 });

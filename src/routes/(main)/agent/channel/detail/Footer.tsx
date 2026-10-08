@@ -1,9 +1,10 @@
 'use client';
 
-import { Alert, Flexbox, Tag } from '@lobehub/ui';
-import { Button, Form as AntdForm, type FormInstance } from 'antd';
+import { Flexbox } from '@lobehub/ui';
+import { Alert, Button, Tag } from '@lobehub/ui/base-ui';
+import { type FormInstance, useWatch } from '@lobehub/ui/base-ui/form';
 import { createStaticStyles } from 'antd-style';
-import { RefreshCw, Save, Trash2 } from 'lucide-react';
+import { RefreshCw, Trash2 } from 'lucide-react';
 import { memo, useEffect, useMemo, useState } from 'react';
 import { Trans, useTranslation } from 'react-i18next';
 
@@ -27,6 +28,12 @@ const styles = createStaticStyles(({ css, cssVar }) => ({
     width: 100%;
     max-width: 1024px;
   `,
+  resultDetail: css`
+    font-family: monospace;
+    font-size: 12px;
+    color: ${cssVar.colorTextTertiary};
+    word-break: break-all;
+  `,
   webhookBox: css`
     overflow: hidden;
     flex: 1;
@@ -47,6 +54,22 @@ const styles = createStaticStyles(({ css, cssVar }) => ({
   `,
 }));
 
+/**
+ * Error body of a result banner: the readable hint first, the raw platform
+ * message below it in a muted tone so it stays available for diagnosis.
+ */
+const ResultDetail = memo<{ detail?: string; hint?: string }>(({ detail, hint }) => {
+  if (!hint) return <>{detail}</>;
+  return (
+    <Flexbox gap={4}>
+      <span>{hint}</span>
+      {detail && <span className={styles.resultDetail}>{detail}</span>}
+    </Flexbox>
+  );
+});
+
+ResultDetail.displayName = 'ResultDetail';
+
 interface FooterProps {
   connecting: boolean;
   connectResult?: TestResult;
@@ -54,8 +77,10 @@ interface FooterProps {
   disabled?: boolean;
   form: FormInstance<ChannelFormValues>;
   hasConfig: boolean;
+  isDirty: boolean;
   onCopied: () => void;
   onDelete: () => void;
+  onDiscard: () => void;
   onSave: () => void;
   onTestConnection: () => void;
   platformDef: SerializedPlatformDefinition;
@@ -63,6 +88,7 @@ interface FooterProps {
   saving: boolean;
   testing: boolean;
   testResult?: TestResult;
+  writeDisabled?: boolean;
 }
 
 const Footer = memo<FooterProps>(
@@ -71,6 +97,7 @@ const Footer = memo<FooterProps>(
     currentConfig,
     form,
     hasConfig,
+    isDirty,
     connectResult,
     connecting,
     disabled,
@@ -78,17 +105,19 @@ const Footer = memo<FooterProps>(
     saving,
     testing,
     testResult,
+    writeDisabled,
     onSave,
     onDelete,
+    onDiscard,
     onTestConnection,
     onCopied,
   }) => {
     const { t } = useTranslation('agent');
     const origin = useAppOrigin();
     const platformId = platformDef.id;
-    const applicationId = AntdForm.useWatch('applicationId', form);
+    const applicationId = useWatch(form, 'applicationId');
 
-    const settingsConnectionMode = AntdForm.useWatch(['settings', 'connectionMode'], form);
+    const settingsConnectionMode = useWatch(form, 'settings.connectionMode');
 
     const showWebhookUrl = platformDef.showWebhookUrl || settingsConnectionMode === 'webhook';
 
@@ -101,8 +130,8 @@ const Footer = memo<FooterProps>(
       const settings = platformDef.schema.find((f) => f.key === 'settings');
       return settings?.properties?.some((f) => f.key === 'userId') ?? false;
     }, [platformDef.schema]);
-    const watchedUserId = AntdForm.useWatch(['settings', 'userId'], form);
-    // `useWatch` returns `undefined` until antd Form hydrates from the
+    const watchedUserId = useWatch(form, 'settings.userId');
+    // `useWatch` returns `undefined` until the form hydrates from the
     // parent's `initialValues`. Fall back to the saved value only during
     // that pre-hydration window so we don't flash the alert for every
     // saved bot. Once the form has reported a value, trust the watched
@@ -131,7 +160,6 @@ const Footer = memo<FooterProps>(
               danger
               disabled={disabled || saving || connecting}
               icon={<Trash2 size={16} />}
-              type="primary"
               onClick={onDelete}
             >
               {t('channel.removeChannel')}
@@ -142,7 +170,7 @@ const Footer = memo<FooterProps>(
           <Flexbox horizontal gap={12}>
             {hasConfig && (
               <Button
-                disabled={disabled || saving || connecting}
+                disabled={writeDisabled || saving || connecting}
                 icon={<RefreshCw size={16} />}
                 loading={testing}
                 onClick={onTestConnection}
@@ -150,9 +178,13 @@ const Footer = memo<FooterProps>(
                 {t('channel.testConnection')}
               </Button>
             )}
+            {isDirty && (
+              <Button disabled={writeDisabled || saving || connecting} onClick={onDiscard}>
+                {t('channel.discard')}
+              </Button>
+            )}
             <Button
-              disabled={disabled}
-              icon={<Save size={16} />}
+              disabled={writeDisabled}
               loading={saving || connecting}
               type="primary"
               onClick={onSave}
@@ -191,8 +223,12 @@ const Footer = memo<FooterProps>(
           <Alert
             closable
             showIcon
-            description={testResult.type === 'error' ? testResult.errorDetail : undefined}
             type={testResult.type}
+            description={
+              testResult.type === 'error' ? (
+                <ResultDetail detail={testResult.errorDetail} hint={testResult.hint} />
+              ) : undefined
+            }
             title={
               testResult.type === 'success' ? t('channel.testSuccess') : t('channel.testFailed')
             }
@@ -260,7 +296,7 @@ const Footer = memo<FooterProps>(
               showIcon
               type="info"
               message={
-                <Trans
+                <Trans<'channel.endpointUrlHint', 'agent'>
                   components={{ bold: <strong /> }}
                   i18nKey="channel.endpointUrlHint"
                   ns="agent"

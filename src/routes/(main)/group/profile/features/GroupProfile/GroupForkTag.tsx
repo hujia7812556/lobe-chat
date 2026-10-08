@@ -1,9 +1,11 @@
 'use client';
 
-import { Icon, Tag } from '@lobehub/ui';
+import { Icon } from '@lobehub/ui';
+import { Tag } from '@lobehub/ui/base-ui';
 import { GitFork } from 'lucide-react';
 import { memo, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { useParams } from 'react-router';
 
 import { useWorkspaceAwareNavigate } from '@/features/Workspace/useWorkspaceAwareNavigate';
 import { marketApiService } from '@/services/marketApi';
@@ -21,7 +23,8 @@ const GroupForkTag = memo(() => {
   const [forkSource, setForkSource] = useState<AgentGroupForkSourceResponse['source']>(null);
   const [loading, setLoading] = useState(false);
 
-  const groupMeta = useAgentGroupStore(agentGroupSelectors.currentGroupMeta);
+  const { gid } = useParams<{ gid: string }>();
+  const groupMeta = useAgentGroupStore((s) => agentGroupSelectors.getGroupMeta(gid ?? '')(s));
   const marketIdentifier = groupMeta?.marketIdentifier;
 
   useEffect(() => {
@@ -59,7 +62,6 @@ const GroupForkTag = memo(() => {
 
   return (
     <Tag
-      bordered={false}
       color="default"
       icon={<Icon icon={GitFork} />}
       style={{ cursor: 'pointer' }}

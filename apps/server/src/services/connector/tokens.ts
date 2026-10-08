@@ -5,7 +5,7 @@ import debug from 'debug';
 import type { ConnectorModel, DecryptedConnector } from '@/database/models/connector';
 import type { ConnectorCredentials } from '@/database/schemas';
 
-import { refreshConnectorToken } from './oauth';
+import { refreshConnectorToken, toClientInformation } from './oauth';
 
 const log = debug('lobe-server:connector:tokens');
 
@@ -53,9 +53,9 @@ export const ensureFreshConnectorToken = async (
     const metadata = await discoverAuthorizationServerMetadata(oidc.issuer);
     if (!metadata) return connector;
 
-    const tokens = await refreshConnectorToken({
+    const { authMethod, tokens } = await refreshConnectorToken({
       authorizationServerUrl: oidc.issuer,
-      clientInformation: { client_id: oidc.clientId, client_secret: oidc.clientSecret },
+      clientInformation: toClientInformation(oidc),
       metadata,
       refreshToken: creds.refreshToken,
       resource: connector.mcpServerUrl ?? undefined,
@@ -68,12 +68,13 @@ export const ensureFreshConnectorToken = async (
 
     await connectorModel.update(connector.id, {
       credentials: JSON.stringify(credentials),
+      ...(authMethod && { oidcConfig: { ...oidc, tokenEndpointAuthMethod: authMethod } }),
       tokenExpiresAt,
     });
 
     return { ...connector, credentials };
-  } catch (err) {
-    log('token refresh failed for connector=%s: %O', connector.id, err);
+  } catch {
+    log('token refresh failed for connector=%s', connector.id);
     return connector;
   }
 };
